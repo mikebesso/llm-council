@@ -1,0 +1,1 @@
+Many are coming to the realization that prompt writing isn’t typing instructions, it’s engineering behavior.  Does this mean we are learning nerual linguistic programming?  Is it a good idea to have many more humans doing NLP?

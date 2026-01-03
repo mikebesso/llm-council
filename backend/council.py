@@ -1,14 +1,22 @@
 """3-stage LLM Council orchestration."""
 
-from typing import List, Dict, Any, Tuple
+import uuid
+from typing import List, Dict, Any, Tuple, Optional
 
 from .openrouter import query_model, query_models_parallel_per_model
 from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
 from .personas import build_messages, persona_for_stage
+from .observability import log_event
 
-
-async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
+async def stage1_collect_responses(user_query: str, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Stage 1: Collect individual responses from all council models."""
+
+    log_event({
+        "event": "council.stage1.start",
+        "run_id": run_id,
+        "user_query_len": len(user_query or ""),
+        "expected_count": len(COUNCIL_MODELS),
+    })
 
     model_to_messages = {
         model: build_messages(user_query, persona=persona_for_stage(1, model))
@@ -25,14 +33,29 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
                 "response": response.get("content", "")
             })
 
+    log_event({
+        "event": "council.stage1.done",
+        "run_id": run_id,
+        "ok_count": len(stage1_results),
+        "expected_count": len(COUNCIL_MODELS),
+    })
+
     return stage1_results
 
 
 async def stage2_collect_rankings(
     user_query: str,
-    stage1_results: List[Dict[str, Any]]
+    stage1_results: List[Dict[str, Any]],
+    run_id: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """Stage 2: Each model ranks the anonymized responses."""
+
+    log_event({
+        "event": "council.stage2.start",
+        "run_id": run_id,
+        "responses_count": len(stage1_results),
+        "expected_count": len(COUNCIL_MODELS),
+    })
 
     labels = [chr(65 + i) for i in range(len(stage1_results))]  # A, B, C, ...
 
@@ -95,15 +118,31 @@ Now provide your evaluation and ranking:"""
                 "parsed_ranking": parsed,
             })
 
+    log_event({
+        "event": "council.stage2.done",
+        "run_id": run_id,
+        "ok_count": len(stage2_results),
+        "expected_count": len(COUNCIL_MODELS),
+    })
+
     return stage2_results, label_to_model
 
 
 async def stage3_synthesize_final(
     user_query: str,
     stage1_results: List[Dict[str, Any]],
-    stage2_results: List[Dict[str, Any]]
+    stage2_results: List[Dict[str, Any]],
+    run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Stage 3: Chairman synthesizes final response."""
+
+    log_event({
+        "event": "council.stage3.start",
+        "run_id": run_id,
+        "stage1_count": len(stage1_results),
+        "stage2_count": len(stage2_results),
+        "chairman_model": CHAIRMAN_MODEL,
+    })
 
     stage1_text = "\n\n".join([
         f"Model: {result['model']}\nResponse: {result['response']}"
@@ -136,10 +175,24 @@ Provide a clear, well-reasoned final answer that represents the council's collec
     response = await query_model(CHAIRMAN_MODEL, messages)
 
     if response is None:
+        log_event({
+            "event": "council.stage3.done",
+            "run_id": run_id,
+            "ok": False,
+            "chairman_model": CHAIRMAN_MODEL,
+        })
         return {
             "model": CHAIRMAN_MODEL,
             "response": "Error: Unable to generate final synthesis.",
         }
+
+    log_event({
+        "event": "council.stage3.done",
+        "run_id": run_id,
+        "ok": True,
+        "chairman_model": CHAIRMAN_MODEL,
+        "content_len": len(response.get("content") or ""),
+    })
 
     return {
         "model": CHAIRMAN_MODEL,
@@ -221,26 +274,46 @@ Title:"""
 async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     """Run the complete 3-stage council process."""
 
-    stage1_results = await stage1_collect_responses(user_query)
+    run_id = f"run-{uuid.uuid4()}"
+    log_event({
+        "event": "council.run.start",
+        "run_id": run_id,
+        "user_query_len": len(user_query or ""),
+        "council_models": COUNCIL_MODELS,
+        "chairman_model": CHAIRMAN_MODEL,
+    })
+
+    stage1_results = await stage1_collect_responses(user_query, run_id=run_id)
 
     if not stage1_results:
         return [], [], {
             "model": "error",
             "response": "All models failed to respond. Please try again.",
-        }, {}
+        }, { "run_id": run_id }
 
-    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results)
+    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results, run_id=run_id)
     aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
 
     stage3_result = await stage3_synthesize_final(
         user_query,
         stage1_results,
         stage2_results,
+        run_id=run_id,
     )
 
     metadata = {
         "label_to_model": label_to_model,
         "aggregate_rankings": aggregate_rankings,
+        "run_id": run_id,
     }
+
+    log_event({
+        "event": "council.run.done",
+        "run_id": run_id,
+        "stage1_count": len(stage1_results),
+        "stage2_count": len(stage2_results),
+        "aggregate_count": len(aggregate_rankings),
+        "final_len": len(stage3_result.get("response") or ""),
+    })
 
     return stage1_results, stage2_results, stage3_result, metadata

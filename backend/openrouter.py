@@ -3,8 +3,9 @@
 import httpx
 import asyncio
 from typing import List, Dict, Any, Optional
+from time import perf_counter
 from .config import OPENROUTER_API_KEY, OPENROUTER_API_URL
-
+from .observability import log_event
 
 async def query_model(
     model: str,
@@ -32,6 +33,8 @@ async def query_model(
         "messages": messages,
     }
 
+    _t0 = perf_counter()
+
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
@@ -39,10 +42,49 @@ async def query_model(
                 headers=headers,
                 json=payload
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                _ms = int((perf_counter() - _t0) * 1000)
+                body = ""
+                try:
+                    body = response.text or ""
+                except Exception:
+                    body = ""
+
+                log_event({
+                    "event": "openrouter.query_model",
+                    "model": model,
+                    "ok": False,
+                    "ms": _ms,
+                    "status": response.status_code,
+                    "error": str(e)[:200],
+                    "body": body[:400],
+                })
+
+                print(f"Error querying model {model}: HTTP {response.status_code} {body[:400]}")
+                return None
 
             data = response.json()
             message = data['choices'][0]['message']
+
+            _ms = int((perf_counter() - _t0) * 1000)
+            try:
+                msg_count = len(messages)
+                msg_chars = sum(len(m.get("content", "") or "") for m in messages)
+            except Exception:
+                msg_count = None
+                msg_chars = None
+
+            log_event({
+                "event": "openrouter.query_model",
+                "model": model,
+                "ok": True,
+                "ms": _ms,
+                "msg_count": msg_count,
+                "msg_chars": msg_chars,
+                "content_len": len(message.get("content") or ""),
+            })
 
             return {
                 'content': message.get('content'),
@@ -50,6 +92,14 @@ async def query_model(
             }
 
     except Exception as e:
+        _ms = int((perf_counter() - _t0) * 1000)
+        log_event({
+            "event": "openrouter.query_model",
+            "model": model,
+            "ok": False,
+            "ms": _ms,
+            "error": str(e)[:200],
+        })
         print(f"Error querying model {model}: {e}")
         return None
 
