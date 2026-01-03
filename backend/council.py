@@ -6,7 +6,79 @@ from typing import List, Dict, Any, Tuple, Optional
 from .openrouter import query_model, query_models_parallel_per_model
 from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
 from .personas import build_messages, persona_for_stage
+
 from .observability import log_event
+
+
+# Helper functions for council prompts
+def build_stage2_ranking_prompt(user_query: str, responses_text: str) -> str:
+    """Build the Stage 2 prompt where each model critiques and ranks anonymized responses."""
+
+    # NOTE: This prompt intentionally forces “second-order” and “embodied constraint” checks.
+    # We want the council to notice asymmetric access (e.g., organizers vs attendees),
+    # bio/waste handling, and other operational realities that frequently get missed.
+    return f"""You are evaluating different responses to the following question:
+
+Question: {user_query}
+
+Here are the responses from different models (anonymized):
+
+{responses_text}
+
+Your task:
+1. Evaluate each response individually. For each response, explain what it does well and what it does poorly.
+2. When evaluating quality, you MUST explicitly check for the following common failure modes (and call them out if missing):
+   - Constraint asymmetry: who bears the consequences vs who keeps an escape hatch (e.g., decision-makers retaining access/resources the public does not).
+   - Embodied constraints: biological/physical limits (bathrooms, water, heat/cold, fatigue, mobility, disability access) and dignity impacts.
+   - Second-order logistics: what happens afterward (waste, cleanup, disposal, enforcement residue, transport, bottlenecks).
+   - Incentives and perverse optimizations: density, optics, throughput, or control prioritized over human needs.
+   - One missing operational detail: explicitly name one concrete logistical or operational detail the response fails to address (e.g., waste removal, staffing, enforcement load, cleanup timing, accessibility edge cases).
+3. Then, at the very end of your response, provide a final ranking.
+
+IMPORTANT: Your final ranking MUST be formatted EXACTLY as follows:
+- Start with the line "FINAL RANKING:" (all caps, with colon)
+- Then list the responses from best to worst as a numbered list
+- Each line should be: number, period, space, then ONLY the response label (e.g., "1. Response A")
+- Do not add any other text or explanations in the ranking section
+
+Example of the correct format for your ENTIRE response:
+
+Response A provides good detail on X but misses Y...
+Response B is accurate but lacks depth on Z...
+Response C offers the most comprehensive answer...
+
+FINAL RANKING:
+1. Response C
+2. Response A
+3. Response B
+
+Now provide your evaluation and ranking:"""
+
+
+def build_stage3_chairman_prompt(user_query: str, stage1_text: str, stage2_text: str) -> str:
+    """Build the Stage 3 prompt where the Chairman synthesizes a final answer."""
+
+    # NOTE: This prompt forces the synthesis to include operational reality checks.
+    return f"""You are the Chairman of an LLM Council. Multiple AI models have provided responses to a user's question, and then ranked each other's responses.
+
+Original Question: {user_query}
+
+STAGE 1 - Individual Responses:
+{stage1_text}
+
+STAGE 2 - Peer Rankings:
+{stage2_text}
+
+Your task as Chairman is to synthesize all of this information into a single, comprehensive, accurate answer to the user's original question.
+
+In your synthesis, you MUST:
+- Preserve the best insights across the council, but also correct blind spots.
+- Explicitly surface “constraint asymmetry” when present (e.g., organizers/officials retaining bathrooms, exits, water, warmth, or privileges that attendees do not).
+- Include embodied constraints and dignity impacts (humans have bodies; plans must respect biology).
+- Include second-order logistics (waste handling/disposal, cleanup, enforcement residue, downstream bottlenecks).
+- If the discussion implies ad-hoc coping (e.g., diapers), explicitly address the operational consequences (biohazard collection, containment, and disposal) and why that signals a planning failure.
+
+Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
 
 async def stage1_collect_responses(user_query: str, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Stage 1: Collect individual responses from all council models."""
@@ -69,36 +141,7 @@ async def stage2_collect_rankings(
         for label, result in zip(labels, stage1_results)
     ])
 
-    ranking_prompt = f"""You are evaluating different responses to the following question:
-
-Question: {user_query}
-
-Here are the responses from different models (anonymized):
-
-{responses_text}
-
-Your task:
-1. First, evaluate each response individually. For each response, explain what it does well and what it does poorly.
-2. Then, at the very end of your response, provide a final ranking.
-
-IMPORTANT: Your final ranking MUST be formatted EXACTLY as follows:
-- Start with the line "FINAL RANKING:" (all caps, with colon)
-- Then list the responses from best to worst as a numbered list
-- Each line should be: number, period, space, then ONLY the response label (e.g., "1. Response A")
-- Do not add any other text or explanations in the ranking section
-
-Example of the correct format for your ENTIRE response:
-
-Response A provides good detail on X but misses Y...
-Response B is accurate but lacks depth on Z...
-Response C offers the most comprehensive answer...
-
-FINAL RANKING:
-1. Response C
-2. Response A
-3. Response B
-
-Now provide your evaluation and ranking:"""
+    ranking_prompt = build_stage2_ranking_prompt(user_query=user_query, responses_text=responses_text)
 
     model_to_messages = {
         model: build_messages(ranking_prompt, persona=persona_for_stage(2, model))
@@ -154,22 +197,11 @@ async def stage3_synthesize_final(
         for result in stage2_results
     ])
 
-    chairman_prompt = f"""You are the Chairman of an LLM Council. Multiple AI models have provided responses to a user's question, and then ranked each other's responses.
-
-Original Question: {user_query}
-
-STAGE 1 - Individual Responses:
-{stage1_text}
-
-STAGE 2 - Peer Rankings:
-{stage2_text}
-
-Your task as Chairman is to synthesize all of this information into a single, comprehensive, accurate answer to the user's original question. Consider:
-- The individual responses and their insights
-- The peer rankings and what they reveal about response quality
-- Any patterns of agreement or disagreement
-
-Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
+    chairman_prompt = build_stage3_chairman_prompt(
+        user_query=user_query,
+        stage1_text=stage1_text,
+        stage2_text=stage2_text,
+    )
 
     messages = build_messages(chairman_prompt, persona=persona_for_stage(3, CHAIRMAN_MODEL))
     response = await query_model(CHAIRMAN_MODEL, messages)
