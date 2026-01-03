@@ -4,13 +4,15 @@ import httpx
 import asyncio
 from typing import List, Dict, Any, Optional
 from time import perf_counter
+from httpx import Timeout
 from .config import OPENROUTER_API_KEY, OPENROUTER_API_URL
 from .observability import log_event
 
 async def query_model(
     model: str,
     messages: List[Dict[str, str]],
-    timeout: float = 120.0
+    timeout: float = 120.0,
+    run_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Query a single model via OpenRouter API.
@@ -36,7 +38,14 @@ async def query_model(
     _t0 = perf_counter()
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        httpx_timeout = Timeout(timeout, connect=10.0, read=timeout, write=10.0, pool=10.0)
+        async with httpx.AsyncClient(timeout=httpx_timeout) as client:
+            log_event({
+                "event": "openrouter.query_model.start",
+                "run_id": run_id,
+                "model": model,
+                "msg_count": len(messages) if messages is not None else None,
+            })
             response = await client.post(
                 OPENROUTER_API_URL,
                 headers=headers,
@@ -60,6 +69,7 @@ async def query_model(
                     "status": response.status_code,
                     "error": str(e)[:200],
                     "body": body[:400],
+                    "run_id": run_id,
                 })
 
                 print(f"Error querying model {model}: HTTP {response.status_code} {body[:400]}")
@@ -84,6 +94,7 @@ async def query_model(
                 "msg_count": msg_count,
                 "msg_chars": msg_chars,
                 "content_len": len(message.get("content") or ""),
+                "run_id": run_id,
             })
 
             return {
@@ -99,6 +110,7 @@ async def query_model(
             "ok": False,
             "ms": _ms,
             "error": str(e)[:200],
+            "run_id": run_id,
         })
         print(f"Error querying model {model}: {e}")
         return None
@@ -106,7 +118,9 @@ async def query_model(
 
 async def query_models_parallel(
     models: List[str],
-    messages: List[Dict[str, str]]
+    messages: List[Dict[str, str]],
+    timeout: float = 120.0,
+    run_id: Optional[str] = None,
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """
     Query multiple models in parallel.
@@ -121,7 +135,7 @@ async def query_models_parallel(
     import asyncio
 
     # Create tasks for all models
-    tasks = [query_model(model, messages) for model in models]
+    tasks = [query_model(model, messages, timeout=timeout, run_id=run_id) for model in models]
 
     # Wait for all to complete
     responses = await asyncio.gather(*tasks)
@@ -133,7 +147,8 @@ async def query_models_parallel(
 # New function: query_models_parallel_per_model
 async def query_models_parallel_per_model(
     model_to_messages: Dict[str, List[Dict[str, str]]],
-    timeout: float = 120.0
+    timeout: float = 120.0,
+    run_id: Optional[str] = None,
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """
     Query multiple models in parallel, allowing different messages per model.
@@ -148,7 +163,7 @@ async def query_models_parallel_per_model(
 
     async def _call(model: str, messages: List[Dict[str, str]]):
         try:
-            return model, await query_model(model, messages, timeout=timeout)
+            return model, await query_model(model, messages, timeout=timeout, run_id=run_id)
         except Exception as e:
             print(f"Error querying model {model}: {e}")
             return model, None

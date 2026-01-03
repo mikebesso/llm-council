@@ -1,13 +1,23 @@
 """3-stage LLM Council orchestration."""
 
+import asyncio
 import uuid
 from typing import List, Dict, Any, Tuple, Optional
 
-from .openrouter import query_model, query_models_parallel_per_model
+# Wall-clock timeouts (seconds) for each stage fan-out.
+# These prevent the council from being held hostage by a single slow/blocked provider.
+STAGE1_WALL_TIMEOUT_S = 45.0
+STAGE2_WALL_TIMEOUT_S = 60.0
+STAGE3_WALL_TIMEOUT_S = 60.0
+
+# Per-request timeout passed to OpenRouter (seconds)
+MODEL_TIMEOUT_S = 120.0
+
+from .openrouter import query_model
 from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
 from .personas import build_messages, persona_for_stage
 
-from .observability import log_event
+from .observability import log_event, set_run_id
 
 
 # Helper functions for council prompts
@@ -83,6 +93,14 @@ Provide a clear, well-reasoned final answer that represents the council's collec
 async def stage1_collect_responses(user_query: str, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Stage 1: Collect individual responses from all council models."""
 
+    if run_id is None:
+        run_id = f"run-{uuid.uuid4()}"
+        set_run_id(run_id)
+        log_event({
+            "event": "council.run.generated",
+            "run_id": run_id,
+        })
+
     log_event({
         "event": "council.stage1.start",
         "run_id": run_id,
@@ -95,14 +113,57 @@ async def stage1_collect_responses(user_query: str, run_id: Optional[str] = None
         for model in COUNCIL_MODELS
     }
 
-    responses = await query_models_parallel_per_model(model_to_messages)
+    # Fan out per-model calls with a wall-clock timeout so we can return partial results.
+    tasks = {
+        model: asyncio.create_task(
+            query_model(model, msgs, timeout=MODEL_TIMEOUT_S, run_id=run_id)
+        )
+        for model, msgs in model_to_messages.items()
+    }
+
+    done, pending = await asyncio.wait(
+        tasks.values(),
+        timeout=STAGE1_WALL_TIMEOUT_S,
+    )
+
+    # Cancel any stragglers so they don't leak work in a long-lived server.
+    pending_models = []
+    for model, task in tasks.items():
+        if task in pending:
+            pending_models.append(model)
+            task.cancel()
+
+    if pending_models:
+        log_event({
+            "event": "council.stage1.timeout",
+            "run_id": run_id,
+            "wall_timeout_s": STAGE1_WALL_TIMEOUT_S,
+            "pending_models": pending_models,
+        })
+
+    responses: Dict[str, Optional[Dict[str, Any]]] = {}
+    for model, task in tasks.items():
+        if task in done:
+            try:
+                responses[model] = task.result()
+            except Exception as e:
+                responses[model] = None
+                log_event({
+                    "event": "council.stage1.task_error",
+                    "run_id": run_id,
+                    "model": model,
+                    "error": str(e)[:200],
+                })
+        else:
+            responses[model] = None
 
     stage1_results: List[Dict[str, Any]] = []
     for model, response in responses.items():
         if response is not None:
             stage1_results.append({
                 "model": model,
-                "response": response.get("content", "")
+                "response": response.get("content", ""),
+                "run_id": run_id,
             })
 
     log_event({
@@ -121,6 +182,9 @@ async def stage2_collect_rankings(
     run_id: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """Stage 2: Each model ranks the anonymized responses."""
+
+    if run_id is None and stage1_results:
+        run_id = stage1_results[0].get("run_id")
 
     log_event({
         "event": "council.stage2.start",
@@ -148,7 +212,48 @@ async def stage2_collect_rankings(
         for model in COUNCIL_MODELS
     }
 
-    responses = await query_models_parallel_per_model(model_to_messages)
+    # Fan out per-model judge calls with a wall-clock timeout so we can return partial results.
+    tasks = {
+        model: asyncio.create_task(
+            query_model(model, msgs, timeout=MODEL_TIMEOUT_S, run_id=run_id)
+        )
+        for model, msgs in model_to_messages.items()
+    }
+
+    done, pending = await asyncio.wait(
+        tasks.values(),
+        timeout=STAGE2_WALL_TIMEOUT_S,
+    )
+
+    pending_models = []
+    for model, task in tasks.items():
+        if task in pending:
+            pending_models.append(model)
+            task.cancel()
+
+    if pending_models:
+        log_event({
+            "event": "council.stage2.timeout",
+            "run_id": run_id,
+            "wall_timeout_s": STAGE2_WALL_TIMEOUT_S,
+            "pending_models": pending_models,
+        })
+
+    responses: Dict[str, Optional[Dict[str, Any]]] = {}
+    for model, task in tasks.items():
+        if task in done:
+            try:
+                responses[model] = task.result()
+            except Exception as e:
+                responses[model] = None
+                log_event({
+                    "event": "council.stage2.task_error",
+                    "run_id": run_id,
+                    "model": model,
+                    "error": str(e)[:200],
+                })
+        else:
+            responses[model] = None
 
     stage2_results: List[Dict[str, Any]] = []
     for model, response in responses.items():
@@ -159,6 +264,7 @@ async def stage2_collect_rankings(
                 "model": model,
                 "ranking": full_text,
                 "parsed_ranking": parsed,
+                "run_id": run_id,
             })
 
     log_event({
@@ -178,6 +284,9 @@ async def stage3_synthesize_final(
     run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Stage 3: Chairman synthesizes final response."""
+
+    if run_id is None and stage1_results:
+        run_id = stage1_results[0].get("run_id")
 
     log_event({
         "event": "council.stage3.start",
@@ -204,7 +313,19 @@ async def stage3_synthesize_final(
     )
 
     messages = build_messages(chairman_prompt, persona=persona_for_stage(3, CHAIRMAN_MODEL))
-    response = await query_model(CHAIRMAN_MODEL, messages)
+    try:
+        response = await asyncio.wait_for(
+            query_model(CHAIRMAN_MODEL, messages, timeout=MODEL_TIMEOUT_S, run_id=run_id),
+            timeout=STAGE3_WALL_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        log_event({
+            "event": "council.stage3.timeout",
+            "run_id": run_id,
+            "wall_timeout_s": STAGE3_WALL_TIMEOUT_S,
+            "chairman_model": CHAIRMAN_MODEL,
+        })
+        response = None
 
     if response is None:
         log_event({
@@ -307,6 +428,7 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     """Run the complete 3-stage council process."""
 
     run_id = f"run-{uuid.uuid4()}"
+    set_run_id(run_id)
     log_event({
         "event": "council.run.start",
         "run_id": run_id,
@@ -348,4 +470,6 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
         "final_len": len(stage3_result.get("response") or ""),
     })
 
+    # Clear ambient context for safety (e.g., in long-lived server processes)
+    set_run_id(None)
     return stage1_results, stage2_results, stage3_result, metadata
