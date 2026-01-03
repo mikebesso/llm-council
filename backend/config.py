@@ -11,9 +11,17 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 # Council members - list of OpenRouter model identifiers
 COUNCIL_MODELS = [
     "openai/gpt-5.1",
+    "openai/gpt-4o,"
     "google/gemini-3-pro-preview",
+    "anthropic/claude-3.5-sonnet",
     "anthropic/claude-sonnet-4.5",
     "x-ai/grok-4",
+    "google/gemini-1.5-pro",
+    "qwen/qwen-2.5-72b-instruct",
+    "deepseek/deepseek-r1",
+    "mistralai/mistral-large",
+    "meta-llama/llama-3.1-70b-instruct",
+    "01-ai/yi-large",
 ]
 
 # Chairman model - synthesizes final response
