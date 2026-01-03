@@ -1,6 +1,7 @@
 """OpenRouter API client for making LLM requests."""
 
 import httpx
+import asyncio
 from typing import List, Dict, Any, Optional
 from .config import OPENROUTER_API_KEY, OPENROUTER_API_URL
 
@@ -77,3 +78,35 @@ async def query_models_parallel(
 
     # Map models to their responses
     return {model: response for model, response in zip(models, responses)}
+
+
+# New function: query_models_parallel_per_model
+async def query_models_parallel_per_model(
+    model_to_messages: Dict[str, List[Dict[str, str]]],
+    timeout: float = 120.0
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    """
+    Query multiple models in parallel, allowing different messages per model.
+
+    Args:
+        model_to_messages: Mapping of model identifier -> messages list
+        timeout: Request timeout in seconds
+
+    Returns:
+        Dict mapping model identifier to response dict (or None if failed)
+    """
+
+    async def _call(model: str, messages: List[Dict[str, str]]):
+        try:
+            return model, await query_model(model, messages, timeout=timeout)
+        except Exception as e:
+            print(f"Error querying model {model}: {e}")
+            return model, None
+
+    tasks = [
+        _call(model, messages)
+        for model, messages in model_to_messages.items()
+    ]
+
+    results = await asyncio.gather(*tasks)
+    return {model: response for model, response in results}

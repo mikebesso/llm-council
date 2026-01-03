@@ -1,0 +1,1 @@
+“Explain why empty HTML table cells sometimes render inconsistently in Outlook. Give: (1) a short explanation, (2) a 5-item checklist of safe practices, and (3) one thing you are not sure about. Keep it under 180 words.”

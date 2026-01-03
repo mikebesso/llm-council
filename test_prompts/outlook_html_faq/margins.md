@@ -1,0 +1,1 @@
+Why do margins often fail in Outlook desktop (Windows) HTML email rendering? Give: (1) a short explanation, (2) a 6-item checklist of safe spacing practices, and (3) one thing you are not sure about. Keep it under 170 words.

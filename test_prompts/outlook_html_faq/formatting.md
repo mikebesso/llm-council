@@ -1,0 +1,1 @@
+Outlook desktop sometimes breaks otherwise-correct email layouts when Windows display scaling is 125% or 150%. Explain why this happens. Give: (1) a short explanation, (2) a checklist of 6 mitigation strategies, and (3) one thing you are not sure about. Keep it under 180 words.
