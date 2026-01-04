@@ -17,7 +17,19 @@ from .openrouter import query_model
 from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
 from .personas import build_messages, persona_for_stage
 
+
 from .observability import log_event, set_run_id
+
+
+def _council_display_name(stage: int, model: str) -> str:
+    """Human-friendly name shown in the UX for a given model at a given stage."""
+    persona = persona_for_stage(stage, model)
+    suffix = model.split("/")[-1] if model else "unknown"
+    # If no per-model override exists, persona.name will be the stage default.
+    # Include a short model suffix so demos remain debuggable.
+    if persona.name in {"Stage1Member", "Stage2Judge", "Chairman"}:
+        return f"{persona.name} · {suffix}"
+    return persona.name
 
 
 # Helper functions for council prompts
@@ -160,8 +172,11 @@ async def stage1_collect_responses(user_query: str, run_id: Optional[str] = None
     stage1_results: List[Dict[str, Any]] = []
     for model, response in responses.items():
         if response is not None:
+            persona_name = persona_for_stage(1, model).name
             stage1_results.append({
-                "model": model,
+                "model": _council_display_name(1, model),
+                "model_id": model,
+                "persona": persona_name,
                 "response": response.get("content", ""),
                 "run_id": run_id,
             })
@@ -196,7 +211,7 @@ async def stage2_collect_rankings(
     labels = [chr(65 + i) for i in range(len(stage1_results))]  # A, B, C, ...
 
     label_to_model = {
-        f"Response {label}": result["model"]
+        f"Response {label}": result.get("model_id") or result["model"]
         for label, result in zip(labels, stage1_results)
     }
 
@@ -260,8 +275,11 @@ async def stage2_collect_rankings(
         if response is not None:
             full_text = response.get("content", "")
             parsed = parse_ranking_from_text(full_text)
+            persona_name = persona_for_stage(2, model).name
             stage2_results.append({
-                "model": model,
+                "model": _council_display_name(2, model),
+                "model_id": model,
+                "persona": persona_name,
                 "ranking": full_text,
                 "parsed_ranking": parsed,
                 "run_id": run_id,
@@ -335,7 +353,12 @@ async def stage3_synthesize_final(
             "chairman_model": CHAIRMAN_MODEL,
         })
         return {
-            "model": CHAIRMAN_MODEL,
+            "model": _council_display_name(3, CHAIRMAN_MODEL),
+            "model_id": CHAIRMAN_MODEL,
+            "persona": persona_for_stage(3, CHAIRMAN_MODEL).name,
+            "chairman_model": _council_display_name(3, CHAIRMAN_MODEL),
+            "chairman_model_id": CHAIRMAN_MODEL,
+            "chairman_persona": persona_for_stage(3, CHAIRMAN_MODEL).name,
             "response": "Error: Unable to generate final synthesis.",
         }
 
@@ -348,7 +371,12 @@ async def stage3_synthesize_final(
     })
 
     return {
-        "model": CHAIRMAN_MODEL,
+        "model": _council_display_name(3, CHAIRMAN_MODEL),
+        "model_id": CHAIRMAN_MODEL,
+        "persona": persona_for_stage(3, CHAIRMAN_MODEL).name,
+        "chairman_model": _council_display_name(3, CHAIRMAN_MODEL),
+        "chairman_model_id": CHAIRMAN_MODEL,
+        "chairman_persona": persona_for_stage(3, CHAIRMAN_MODEL).name,
         "response": response.get("content", ""),
     }
 

@@ -25,7 +25,7 @@ class Persona:
 # ----------------------------
 
 STAGE1_MEMBER = Persona(
-    name="Stage1Member",
+    name="Mary",
     system_prompt=(
         "You are a council member in a multi-model deliberation system.\n"
         "Goal: answer the user's question directly, accurately, and usefully.\n"
@@ -38,7 +38,7 @@ STAGE1_MEMBER = Persona(
 )
 
 STAGE2_JUDGE = Persona(
-    name="Stage2Judge",
+    name="John",
     system_prompt=(
         "You are a judge in an LLM Council. Your job is to evaluate responses.\n"
         "Goal: fairly assess correctness, completeness, clarity, and helpfulness.\n"
