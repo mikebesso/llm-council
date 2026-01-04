@@ -9,6 +9,8 @@ import uuid
 import json
 import asyncio
 
+from .observability import log_event, set_run_id
+
 from . import storage
 from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
 
@@ -138,7 +140,18 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
     is_first_message = len(conversation["messages"]) == 0
 
     async def event_generator():
+        run_id = None
         try:
+            # Stream lifecycle observability
+            run_id = None
+            log_event({
+                "event": "api.stream.start",
+                "run_id": run_id,
+                "conversation_id": conversation_id,
+                "is_first_message": is_first_message,
+                "user_query_len": len(request.content or ""),
+            })
+
             # Add user message
             storage.add_user_message(conversation_id, request.content)
 
@@ -150,17 +163,48 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             # Stage 1: Collect responses
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
             stage1_results = await stage1_collect_responses(request.content)
+
+            # Derive run_id from stage1 results (stage1 attaches run_id to each result)
+            try:
+                if stage1_results and isinstance(stage1_results, list):
+                    run_id = stage1_results[0].get("run_id")
+            except Exception:
+                run_id = run_id
+
+            if run_id:
+                set_run_id(run_id)
+
+            log_event({
+                "event": "api.stream.stage1.done",
+                "run_id": run_id,
+                "conversation_id": conversation_id,
+                "stage1_count": len(stage1_results) if stage1_results else 0,
+            })
+
             yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
 
             # Stage 2: Collect rankings
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
             stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+            log_event({
+                "event": "api.stream.stage2.done",
+                "run_id": run_id,
+                "conversation_id": conversation_id,
+                "stage2_count": len(stage2_results) if stage2_results else 0,
+                "aggregate_count": len(aggregate_rankings) if aggregate_rankings else 0,
+            })
             yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
 
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+            log_event({
+                "event": "api.stream.stage3.done",
+                "run_id": run_id,
+                "conversation_id": conversation_id,
+                "final_len": len((stage3_result or {}).get("response") or ""),
+            })
             yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
 
             # Wait for title generation if it was started
@@ -178,11 +222,38 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             )
 
             # Send completion event
+            log_event({
+                "event": "api.stream.final_yield",
+                "run_id": run_id,
+                "conversation_id": conversation_id,
+            })
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
 
+        except asyncio.CancelledError:
+            # Client disconnected / request cancelled
+            log_event({
+                "event": "api.stream.cancelled",
+                "run_id": run_id,
+                "conversation_id": conversation_id,
+            })
+            raise
+
         except Exception as e:
+            log_event({
+                "event": "api.stream.error",
+                "run_id": run_id,
+                "conversation_id": conversation_id,
+                "error": str(e)[:500],
+            })
             # Send error event
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+        finally:
+            log_event({
+                "event": "api.stream.close",
+                "run_id": run_id,
+                "conversation_id": conversation_id,
+            })
 
     return StreamingResponse(
         event_generator(),
