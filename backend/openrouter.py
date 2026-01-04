@@ -3,10 +3,35 @@
 import httpx
 import asyncio
 from typing import List, Dict, Any, Optional
+from fastapi import HTTPException
 from time import perf_counter
 from httpx import Timeout
 from .config import OPENROUTER_API_KEY, OPENROUTER_API_URL
 from .observability import log_event
+
+TRANSIENT_RETRY_STATUS_CODES = {429, 502, 503}
+NO_RETRY_STATUS_CODES = {400, 401, 403, 402}
+
+def _log_http_status_error(*, response: httpx.Response, model: str, run_id: Optional[str], t0: float, err: Exception):
+    _ms = int((perf_counter() - t0) * 1000)
+    body = ""
+    try:
+        body = response.text or ""
+    except Exception:
+        body = ""
+
+    log_event({
+        "event": "openrouter.query_model",
+        "model": model,
+        "ok": False,
+        "ms": _ms,
+        "status": response.status_code,
+        "error": str(err)[:200],
+        "body": body[:400],
+        "run_id": run_id,
+    })
+
+    print(f"Error querying model {model}: HTTP {response.status_code} {body[:400]}")
 
 async def query_model(
     model: str,
@@ -46,34 +71,63 @@ async def query_model(
                 "model": model,
                 "msg_count": len(messages) if messages is not None else None,
             })
-            response = await client.post(
-                OPENROUTER_API_URL,
-                headers=headers,
-                json=payload
-            )
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                _ms = int((perf_counter() - _t0) * 1000)
-                body = ""
+
+            # Retry once on transient upstream/proxy/provider hiccups.
+            attempt = 0
+            while True:
+                attempt += 1
                 try:
-                    body = response.text or ""
-                except Exception:
-                    body = ""
+                    response = await client.post(
+                        OPENROUTER_API_URL,
+                        headers=headers,
+                        json=payload
+                    )
+                    response.raise_for_status()
+                    break
 
-                log_event({
-                    "event": "openrouter.query_model",
-                    "model": model,
-                    "ok": False,
-                    "ms": _ms,
-                    "status": response.status_code,
-                    "error": str(e)[:200],
-                    "body": body[:400],
-                    "run_id": run_id,
-                })
+                except asyncio.CancelledError:
+                    # Cancellation should propagate so upstream can stop doing work.
+                    _ms = int((perf_counter() - _t0) * 1000)
+                    log_event({
+                        "event": "openrouter.query_model.cancelled",
+                        "model": model,
+                        "ok": False,
+                        "ms": _ms,
+                        "run_id": run_id,
+                    })
+                    raise
 
-                print(f"Error querying model {model}: HTTP {response.status_code} {body[:400]}")
-                return None
+                except httpx.HTTPStatusError as e:
+                    status = getattr(e.response, "status_code", None) or getattr(response, "status_code", None)
+
+                    # Credits exhausted: surface clearly (no retry).
+                    if status == 402:
+                        _log_http_status_error(response=response, model=model, run_id=run_id, t0=_t0, err=e)
+                        raise HTTPException(
+                            status_code=402,
+                            detail="Upstream provider credits exhausted (402). Please check billing/credits or switch models.",
+                        )
+
+                    # Never retry on caller/auth issues.
+                    if status in {400, 401, 403}:
+                        _log_http_status_error(response=response, model=model, run_id=run_id, t0=_t0, err=e)
+                        return None
+
+                    # Retry once on transient codes.
+                    if status in TRANSIENT_RETRY_STATUS_CODES and attempt == 1:
+                        _log_http_status_error(response=response, model=model, run_id=run_id, t0=_t0, err=e)
+                        log_event({
+                            "event": "openrouter.query_model.retry.transient",
+                            "model": model,
+                            "status": status,
+                            "run_id": run_id,
+                        })
+                        # Yield control so cancellation can cut in promptly.
+                        await asyncio.sleep(0)
+                        continue
+
+                    _log_http_status_error(response=response, model=model, run_id=run_id, t0=_t0, err=e)
+                    return None
 
             data = response.json()
             message = data['choices'][0]['message']
@@ -93,7 +147,7 @@ async def query_model(
                 "ms": _ms,
                 "msg_count": msg_count,
                 "msg_chars": msg_chars,
-                "content_len": len(message.get("content") or ""),
+                "content_len": len(message.get('content') or ""),
                 "run_id": run_id,
             })
 
@@ -101,6 +155,10 @@ async def query_model(
                 'content': message.get('content'),
                 'reasoning_details': message.get('reasoning_details')
             }
+
+    except asyncio.CancelledError:
+        # Allow upstream cancellation to propagate.
+        raise
 
     except Exception as e:
         _ms = int((perf_counter() - _t0) * 1000)

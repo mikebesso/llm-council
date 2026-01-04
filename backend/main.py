@@ -1,6 +1,6 @@
 """FastAPI backend for LLM Council."""
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -8,6 +8,92 @@ from typing import List, Dict, Any
 import uuid
 import json
 import asyncio
+
+# --- Resilience helpers -----------------------------------------------------
+# NOTE: We intentionally keep these helpers lightweight and dependency-free.
+# They rely on common exception shapes (httpx, aiohttp, FastAPI HTTPException)
+# rather than importing provider-specific SDK types.
+
+# TODO (future): UI diagnostics for streaming stages
+#  - stage*_pending_models
+#  - stage2_judges_completed_count
+#  - wall_timeouts_used
+#  - Expose in SSE payloads so UI can explain partial completion
+#    (e.g., "8/12 judges responded before deadline; proceeding.")
+
+TRANSIENT_RETRY_STATUS_CODES = {429, 502, 503}
+NO_RETRY_STATUS_CODES = {400, 401, 403, 402}
+
+
+def _extract_status_code(exc: Exception) -> int | None:
+    """Best-effort extraction of an HTTP-ish status code from an exception."""
+    # FastAPI / Starlette
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int):
+        return code
+
+    # httpx.HTTPStatusError: exc.response.status_code
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        code = getattr(resp, "status_code", None)
+        if isinstance(code, int):
+            return code
+
+    # aiohttp.ClientResponseError: exc.status
+    code = getattr(exc, "status", None)
+    if isinstance(code, int):
+        return code
+
+    return None
+
+
+async def _retry_once_on_transient(fn, *, context: dict | None = None):
+    """Retry once on transient upstream/proxy/provider hiccups."""
+    ctx = context or {}
+    try:
+        return await fn()
+    except Exception as e:
+        status = _extract_status_code(e)
+
+        # Never retry on clear caller/auth/credits issues.
+        if status in NO_RETRY_STATUS_CODES:
+            raise
+
+        if status in TRANSIENT_RETRY_STATUS_CODES:
+            log_event({
+                "event": "api.retry.transient",
+                "status_code": status,
+                "error": str(e)[:500],
+                **ctx,
+            })
+            # Yield control so cancellations propagate cleanly.
+            await asyncio.sleep(0)
+            return await fn()
+
+        # Unknown errors: don't blindly retry.
+        raise
+
+
+async def _raise_if_disconnected(request: Request):
+    """Raise CancelledError if the client has disconnected."""
+    try:
+        if await request.is_disconnected():
+            raise asyncio.CancelledError()
+    except AttributeError:
+        # Older/alternate Request implementations may not support is_disconnected.
+        # In those cases, we fall back to normal cancellation semantics.
+        return
+
+# TODO (future): Model cooldown circuit breaker
+#   - Track per-model failures/timeouts in-memory across a sliding window.
+#   - If a model fails 3 times, skip it for 10 minutes.
+#   - Emit: council.model.cooldown
+#
+# TODO (future): UI-facing diagnostics in SSE payloads
+#   - stage*_pending_models, stage2_judges_completed_count, wall_timeouts used, etc.
+#   - Goal: UI can say "8/12 judges responded before deadline; proceeding."
+
+# ---------------------------------------------------------------------------
 
 from .observability import log_event, set_run_id
 
@@ -104,8 +190,12 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         storage.update_conversation_title(conversation_id, title)
 
     # Run the 3-stage council process
-    stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
-        request.content
+    stage1_results, stage2_results, stage3_result, metadata = await _retry_once_on_transient(
+        lambda: run_full_council(request.content),
+        context={
+            "conversation_id": conversation_id,
+            "path": "/api/conversations/{conversation_id}/message",
+        },
     )
 
     # Add assistant message with all stages
@@ -126,7 +216,7 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
 
 
 @app.post("/api/conversations/{conversation_id}/message/stream")
-async def send_message_stream(conversation_id: str, request: SendMessageRequest):
+async def send_message_stream(conversation_id: str, request: SendMessageRequest, http_request: Request):
     """
     Send a message and stream the 3-stage council process.
     Returns Server-Sent Events as each stage completes.
@@ -152,8 +242,12 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 "user_query_len": len(request.content or ""),
             })
 
+            await _raise_if_disconnected(http_request)
+
             # Add user message
             storage.add_user_message(conversation_id, request.content)
+
+            await _raise_if_disconnected(http_request)
 
             # Start title generation in parallel (don't await yet)
             title_task = None
@@ -162,7 +256,15 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
             # Stage 1: Collect responses
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            stage1_results = await stage1_collect_responses(request.content)
+            await _raise_if_disconnected(http_request)
+            stage1_results = await _retry_once_on_transient(
+                lambda: stage1_collect_responses(request.content),
+                context={
+                    "conversation_id": conversation_id,
+                    "stage": 1,
+                },
+            )
+            await _raise_if_disconnected(http_request)
 
             # Derive run_id from stage1 results (stage1 attaches run_id to each result)
             try:
@@ -185,7 +287,15 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
             # Stage 2: Collect rankings
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
+            await _raise_if_disconnected(http_request)
+            stage2_results, label_to_model = await _retry_once_on_transient(
+                lambda: stage2_collect_rankings(request.content, stage1_results),
+                context={
+                    "conversation_id": conversation_id,
+                    "stage": 2,
+                },
+            )
+            await _raise_if_disconnected(http_request)
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
             log_event({
                 "event": "api.stream.stage2.done",
@@ -198,7 +308,15 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+            await _raise_if_disconnected(http_request)
+            stage3_result = await _retry_once_on_transient(
+                lambda: stage3_synthesize_final(request.content, stage1_results, stage2_results),
+                context={
+                    "conversation_id": conversation_id,
+                    "stage": 3,
+                },
+            )
+            await _raise_if_disconnected(http_request)
             log_event({
                 "event": "api.stream.stage3.done",
                 "run_id": run_id,
@@ -209,6 +327,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
             # Wait for title generation if it was started
             if title_task:
+                await _raise_if_disconnected(http_request)
                 title = await title_task
                 storage.update_conversation_title(conversation_id, title)
                 yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
@@ -230,7 +349,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
 
         except asyncio.CancelledError:
-            # Client disconnected / request cancelled
+            # Can be triggered by client disconnect or explicit cancellation checks.
             log_event({
                 "event": "api.stream.cancelled",
                 "run_id": run_id,
@@ -239,6 +358,11 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             raise
 
         except Exception as e:
+            status = _extract_status_code(e)
+            if status == 402:
+                # Surface a clear UI message. No retry.
+                yield f"data: {json.dumps({'type': 'error', 'code': 402, 'message': 'Upstream provider credits exhausted (402). Please check billing/credits or switch models.'})}\n\n"
+                return
             log_event({
                 "event": "api.stream.error",
                 "run_id": run_id,
