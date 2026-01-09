@@ -84,6 +84,29 @@ async def _raise_if_disconnected(request: Request):
         # In those cases, we fall back to normal cancellation semantics.
         return
 
+
+def _sanitize_for_conversation(payload):
+    """Remove provider model identifiers from conversation-facing payloads.
+    Personas/member names are allowed; model ids belong in appendix/debug views."""
+    # TODO (future): Rename persona.name to persona.role (internal) and keep it out of the
+    # conversation UX. Personas select behavior; members are the only human-facing identity.
+    if isinstance(payload, list):
+        return [_sanitize_for_conversation(p) for p in payload]
+
+    if isinstance(payload, dict):
+        cleaned = {}
+        for k, v in payload.items():
+            # Strip internal identifiers from conversation UX
+            if k in {"model_id", "chairman_model_id", "persona", "chairman_persona"}:
+                continue
+            cleaned[k] = _sanitize_for_conversation(v)
+        return cleaned
+
+    return payload
+
+# TODO (future): Provide a separate appendix/debug endpoint that exposes model ids
+# and provider details for transparency without polluting the conversation UX.
+
 # TODO (future): Model cooldown circuit breaker
 #   - Track per-model failures/timeouts in-memory across a sliding window.
 #   - If a model fails 3 times, skip it for 10 minutes.
@@ -207,12 +230,12 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     )
 
     # Return the complete response with metadata
-    return {
+    return _sanitize_for_conversation({
         "stage1": stage1_results,
         "stage2": stage2_results,
         "stage3": stage3_result,
         "metadata": metadata
-    }
+    })
 
 
 @app.post("/api/conversations/{conversation_id}/message/stream")
@@ -283,7 +306,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest,
                 "stage1_count": len(stage1_results) if stage1_results else 0,
             })
 
-            yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
+            yield f"data: {json.dumps({'type': 'stage1_complete', 'data': _sanitize_for_conversation(stage1_results)})}\n\n"
 
             # Stage 2: Collect rankings
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
@@ -304,7 +327,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest,
                 "stage2_count": len(stage2_results) if stage2_results else 0,
                 "aggregate_count": len(aggregate_rankings) if aggregate_rankings else 0,
             })
-            yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
+            yield f"data: {json.dumps({'type': 'stage2_complete', 'data': _sanitize_for_conversation(stage2_results), 'metadata': _sanitize_for_conversation({'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings})})}\n\n"
 
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
@@ -323,7 +346,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest,
                 "conversation_id": conversation_id,
                 "final_len": len((stage3_result or {}).get("response") or ""),
             })
-            yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
+            yield f"data: {json.dumps({'type': 'stage3_complete', 'data': _sanitize_for_conversation(stage3_result)})}\n\n"
 
             # Wait for title generation if it was started
             if title_task:

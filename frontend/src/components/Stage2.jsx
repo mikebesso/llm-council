@@ -2,14 +2,30 @@ import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import './Stage2.css';
 
+function displayJudgeName(rank, index) {
+  // Prefer backend-provided friendly names/personas; avoid leaking provider model ids into the UX.
+  // TODO: Revisit whether to optionally display provider model ids for debugging.
+  if (rank?.persona) return rank.persona;
+  if (rank?.model && !rank.model.includes('/')) return rank.model;
+  return `Judge ${index + 1}`;
+}
+
+function displayMemberName(value, fallbackLabel) {
+  // Prefer friendly names (no slash). If it's a provider id, hide it.
+  // TODO: Revisit whether to optionally display provider model ids for debugging.
+  if (!value) return fallbackLabel;
+  if (!value.includes('/')) return value;
+  return fallbackLabel;
+}
+
 function deAnonymizeText(text, labelToModel) {
   if (!labelToModel) return text;
 
   let result = text;
-  // Replace each "Response X" with the actual model name
-  Object.entries(labelToModel).forEach(([label, model]) => {
-    const modelShortName = model.split('/')[1] || model;
-    result = result.replace(new RegExp(label, 'g'), `**${modelShortName}**`);
+  // Replace Response A/B/C labels with council member names when available
+  Object.entries(labelToModel).forEach(([label, memberName]) => {
+    const replacement = memberName || label;
+    result = result.replace(new RegExp(label, 'g'), `**${replacement}**`);
   });
   return result;
 }
@@ -27,8 +43,8 @@ export default function Stage2({ rankings, labelToModel, aggregateRankings }) {
 
       <h4>Raw Evaluations</h4>
       <p className="stage-description">
-        Each model evaluated all responses (anonymized as Response A, B, C, etc.) and provided rankings.
-        Below, model names are shown in <strong>bold</strong> for readability, but the original evaluation used anonymous labels.
+        Each council member evaluated all responses (anonymized as Response A, B, C, etc.) and provided rankings.
+        For clarity, anonymous labels are replaced below with the corresponding council member names.
       </p>
 
       <div className="tabs">
@@ -38,14 +54,14 @@ export default function Stage2({ rankings, labelToModel, aggregateRankings }) {
             className={`tab ${activeTab === index ? 'active' : ''}`}
             onClick={() => setActiveTab(index)}
           >
-            {rank.model.split('/')[1] || rank.model}
+            {displayJudgeName(rank, index)}
           </button>
         ))}
       </div>
 
       <div className="tab-content">
         <div className="ranking-model">
-          {rankings[activeTab].model}
+          {displayJudgeName(rankings[activeTab], activeTab)}
         </div>
         <div className="ranking-content markdown-content">
           <ReactMarkdown>
@@ -56,12 +72,12 @@ export default function Stage2({ rankings, labelToModel, aggregateRankings }) {
         {rankings[activeTab].parsed_ranking &&
          rankings[activeTab].parsed_ranking.length > 0 && (
           <div className="parsed-ranking">
-            <strong>Extracted Ranking:</strong>
+            <strong>Extracted Ranking (by council member):</strong>
             <ol>
               {rankings[activeTab].parsed_ranking.map((label, i) => (
                 <li key={i}>
                   {labelToModel && labelToModel[label]
-                    ? labelToModel[label].split('/')[1] || labelToModel[label]
+                    ? displayMemberName(labelToModel[label], label)
                     : label}
                 </li>
               ))}
@@ -81,7 +97,7 @@ export default function Stage2({ rankings, labelToModel, aggregateRankings }) {
               <div key={index} className="aggregate-item">
                 <span className="rank-position">#{index + 1}</span>
                 <span className="rank-model">
-                  {agg.model.split('/')[1] || agg.model}
+                  {displayMemberName(agg.model, '—')}
                 </span>
                 <span className="rank-score">
                   Avg: {agg.average_rank.toFixed(2)}

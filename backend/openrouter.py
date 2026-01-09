@@ -111,6 +111,19 @@ async def query_model(
                     # Never retry on caller/auth issues.
                     if status in {400, 401, 403}:
                         _log_http_status_error(response=response, model=model, run_id=run_id, t0=_t0, err=e)
+
+                        # Auth failures should be loud and actionable.
+                        if status in {401, 403}:
+                            raise HTTPException(
+                                status_code=status,
+                                detail=(
+                                    "OpenRouter authentication failed (" + str(status) + "). "
+                                    "Your OPENROUTER_API_KEY is missing, invalid, or expired. "
+                                    "Update it in your .env file (OPENROUTER_API_KEY=...) and restart the backend."
+                                ),
+                            )
+
+                        # Other client errors: treat as per-model failure.
                         return None
 
                     # Retry once on transient codes.
@@ -158,6 +171,10 @@ async def query_model(
 
     except asyncio.CancelledError:
         # Allow upstream cancellation to propagate.
+        raise
+
+    except HTTPException:
+        # Let API-layer handlers surface the message cleanly.
         raise
 
     except Exception as e:
@@ -222,6 +239,9 @@ async def query_models_parallel_per_model(
     async def _call(model: str, messages: List[Dict[str, str]]):
         try:
             return model, await query_model(model, messages, timeout=timeout, run_id=run_id)
+        except HTTPException:
+            # Auth/credits/etc. should surface to the caller.
+            raise
         except Exception as e:
             print(f"Error querying model {model}: {e}")
             return model, None

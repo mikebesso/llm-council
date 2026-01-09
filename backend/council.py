@@ -14,22 +14,24 @@ STAGE3_WALL_TIMEOUT_S = 60.0
 MODEL_TIMEOUT_S = 120.0
 
 from .openrouter import query_model
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
-from .personas import build_messages, persona_for_stage
+from .config import COUNCIL_MEMBERS, CHAIRMAN_MEMBER, CHAIRMAN_MODEL
+from .personas import build_messages, persona_for_stage, persona_for_member
 
 
 from .observability import log_event, set_run_id
 
 
-def _council_display_name(stage: int, model: str) -> str:
-    """Human-friendly name shown in the UX for a given model at a given stage."""
-    persona = persona_for_stage(stage, model)
-    suffix = model.split("/")[-1] if model else "unknown"
-    # If no per-model override exists, persona.name will be the stage default.
-    # Include a short model suffix so demos remain debuggable.
-    if persona.name in {"Stage1Member", "Stage2Judge", "Chairman"}:
-        return f"{persona.name} · {suffix}"
-    return persona.name
+
+def _member_name_for_model_id(model_id: str, fallback: str = "Member") -> str:
+    """Return the configured council member name for a model_id (no hard-coded names)."""
+    if CHAIRMAN_MEMBER and CHAIRMAN_MEMBER.get("model_id") == model_id:
+        return CHAIRMAN_MEMBER.get("name") or fallback
+
+    for m in COUNCIL_MEMBERS:
+        if m.get("model_id") == model_id:
+            return m.get("name") or fallback
+
+    return fallback
 
 
 # Helper functions for council prompts
@@ -117,12 +119,15 @@ async def stage1_collect_responses(user_query: str, run_id: Optional[str] = None
         "event": "council.stage1.start",
         "run_id": run_id,
         "user_query_len": len(user_query or ""),
-        "expected_count": len(COUNCIL_MODELS),
+        "expected_count": len(COUNCIL_MEMBERS),
     })
 
     model_to_messages = {
-        model: build_messages(user_query, persona=persona_for_stage(1, model))
-        for model in COUNCIL_MODELS
+        member["model_id"]: build_messages(
+            user_query,
+            persona=persona_for_member(member.get("persona", ""), fallback_stage=1),
+        )
+        for member in COUNCIL_MEMBERS
     }
 
     # Fan out per-model calls with a wall-clock timeout so we can return partial results.
@@ -172,20 +177,28 @@ async def stage1_collect_responses(user_query: str, run_id: Optional[str] = None
     stage1_results: List[Dict[str, Any]] = []
     for model, response in responses.items():
         if response is not None:
-            persona_name = persona_for_stage(1, model).name
+            member_name = _member_name_for_model_id(model, fallback="Member")
+            persona_name = persona_for_member(
+                next((m.get("persona") for m in COUNCIL_MEMBERS if m.get("model_id") == model), ""),
+                fallback_stage=1,
+            ).name
             stage1_results.append({
-                "model": _council_display_name(1, model),
-                "model_id": model,
+                # Backward-compatible UI field (do not show provider model ids in conversation UX)
+                "model": member_name,
+                # Truthful schema
+                "member_name": member_name,
                 "persona": persona_name,
                 "response": response.get("content", ""),
                 "run_id": run_id,
+                # TODO: Move model identifiers to an appendix/debug view rather than the conversation UX.
+                "model_id": model,
             })
 
     log_event({
         "event": "council.stage1.done",
         "run_id": run_id,
         "ok_count": len(stage1_results),
-        "expected_count": len(COUNCIL_MODELS),
+        "expected_count": len(COUNCIL_MEMBERS),
     })
 
     return stage1_results
@@ -205,15 +218,16 @@ async def stage2_collect_rankings(
         "event": "council.stage2.start",
         "run_id": run_id,
         "responses_count": len(stage1_results),
-        "expected_count": len(COUNCIL_MODELS),
+        "expected_count": len(COUNCIL_MEMBERS),
     })
 
     labels = [chr(65 + i) for i in range(len(stage1_results))]  # A, B, C, ...
 
     label_to_model = {
-        f"Response {label}": result.get("model_id") or result["model"]
+        f"Response {label}": (result.get("member_name") or result.get("model") or f"Member {label}")
         for label, result in zip(labels, stage1_results)
     }
+    # TODO: Provide a separate label_to_model_id mapping for an appendix/debug view.
 
     responses_text = "\n\n".join([
         f"Response {label}:\n{result['response']}"
@@ -223,8 +237,11 @@ async def stage2_collect_rankings(
     ranking_prompt = build_stage2_ranking_prompt(user_query=user_query, responses_text=responses_text)
 
     model_to_messages = {
-        model: build_messages(ranking_prompt, persona=persona_for_stage(2, model))
-        for model in COUNCIL_MODELS
+        member["model_id"]: build_messages(
+            ranking_prompt,
+            persona=persona_for_member(member.get("persona", ""), fallback_stage=2),
+        )
+        for member in COUNCIL_MEMBERS
     }
 
     # Fan out per-model judge calls with a wall-clock timeout so we can return partial results.
@@ -275,21 +292,27 @@ async def stage2_collect_rankings(
         if response is not None:
             full_text = response.get("content", "")
             parsed = parse_ranking_from_text(full_text)
-            persona_name = persona_for_stage(2, model).name
+            member_name = _member_name_for_model_id(model, fallback="Judge")
+            persona_name = persona_for_member(
+                next((m.get("persona") for m in COUNCIL_MEMBERS if m.get("model_id") == model), ""),
+                fallback_stage=2,
+            ).name
             stage2_results.append({
-                "model": _council_display_name(2, model),
-                "model_id": model,
+                "model": member_name,
+                "member_name": member_name,
                 "persona": persona_name,
                 "ranking": full_text,
                 "parsed_ranking": parsed,
                 "run_id": run_id,
+                # TODO: Move model identifiers to an appendix/debug view rather than the conversation UX.
+                "model_id": model,
             })
 
     log_event({
         "event": "council.stage2.done",
         "run_id": run_id,
         "ok_count": len(stage2_results),
-        "expected_count": len(COUNCIL_MODELS),
+        "expected_count": len(COUNCIL_MEMBERS),
     })
 
     return stage2_results, label_to_model
@@ -315,12 +338,12 @@ async def stage3_synthesize_final(
     })
 
     stage1_text = "\n\n".join([
-        f"Model: {result['model']}\nResponse: {result['response']}"
+        f"Member: {result.get('member_name') or result.get('model')}\nResponse: {result['response']}"
         for result in stage1_results
     ])
 
     stage2_text = "\n\n".join([
-        f"Model: {result['model']}\nRanking: {result['ranking']}"
+        f"Member: {result.get('member_name') or result.get('model')}\nRanking: {result['ranking']}"
         for result in stage2_results
     ])
 
@@ -330,7 +353,10 @@ async def stage3_synthesize_final(
         stage2_text=stage2_text,
     )
 
-    messages = build_messages(chairman_prompt, persona=persona_for_stage(3, CHAIRMAN_MODEL))
+    messages = build_messages(
+        chairman_prompt,
+        persona=persona_for_member(CHAIRMAN_MEMBER.get("persona", ""), fallback_stage=3),
+    )
     try:
         response = await asyncio.wait_for(
             query_model(CHAIRMAN_MODEL, messages, timeout=MODEL_TIMEOUT_S, run_id=run_id),
@@ -352,14 +378,19 @@ async def stage3_synthesize_final(
             "ok": False,
             "chairman_model": CHAIRMAN_MODEL,
         })
+        chair_name = _member_name_for_model_id(CHAIRMAN_MODEL, fallback="Chair")
+        chair_persona = persona_for_member(CHAIRMAN_MEMBER.get("persona", ""), fallback_stage=3).name
         return {
-            "model": _council_display_name(3, CHAIRMAN_MODEL),
-            "model_id": CHAIRMAN_MODEL,
-            "persona": persona_for_stage(3, CHAIRMAN_MODEL).name,
-            "chairman_model": _council_display_name(3, CHAIRMAN_MODEL),
-            "chairman_model_id": CHAIRMAN_MODEL,
-            "chairman_persona": persona_for_stage(3, CHAIRMAN_MODEL).name,
+            "model": chair_name,
+            "member_name": chair_name,
+            "persona": chair_persona,
+            "chairman_model": chair_name,
+            "chairman_member_name": chair_name,
+            "chairman_persona": chair_persona,
             "response": "Error: Unable to generate final synthesis.",
+            # TODO: Move model identifiers to an appendix/debug view rather than the conversation UX.
+            "model_id": CHAIRMAN_MODEL,
+            "chairman_model_id": CHAIRMAN_MODEL,
         }
 
     log_event({
@@ -370,14 +401,19 @@ async def stage3_synthesize_final(
         "content_len": len(response.get("content") or ""),
     })
 
+    chair_name = _member_name_for_model_id(CHAIRMAN_MODEL, fallback="Chair")
+    chair_persona = persona_for_member(CHAIRMAN_MEMBER.get("persona", ""), fallback_stage=3).name
     return {
-        "model": _council_display_name(3, CHAIRMAN_MODEL),
-        "model_id": CHAIRMAN_MODEL,
-        "persona": persona_for_stage(3, CHAIRMAN_MODEL).name,
-        "chairman_model": _council_display_name(3, CHAIRMAN_MODEL),
-        "chairman_model_id": CHAIRMAN_MODEL,
-        "chairman_persona": persona_for_stage(3, CHAIRMAN_MODEL).name,
+        "model": chair_name,
+        "member_name": chair_name,
+        "persona": chair_persona,
+        "chairman_model": chair_name,
+        "chairman_member_name": chair_name,
+        "chairman_persona": chair_persona,
         "response": response.get("content", ""),
+        # TODO: Move model identifiers to an appendix/debug view rather than the conversation UX.
+        "model_id": CHAIRMAN_MODEL,
+        "chairman_model_id": CHAIRMAN_MODEL,
     }
 
 
@@ -461,7 +497,7 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
         "event": "council.run.start",
         "run_id": run_id,
         "user_query_len": len(user_query or ""),
-        "council_models": COUNCIL_MODELS,
+        "council_members": [{"name": m.get("name"), "model_id": m.get("model_id"), "persona": m.get("persona")} for m in COUNCIL_MEMBERS],
         "chairman_model": CHAIRMAN_MODEL,
     })
 
