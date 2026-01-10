@@ -125,7 +125,9 @@ async def stage1_collect_responses(user_query: str, run_id: Optional[str] = None
     model_to_messages = {
         member["model_id"]: build_messages(
             user_query,
-            persona=persona_for_member(member.get("persona", ""), fallback_stage=1),
+            persona=persona_for_member(
+                member.get("persona", ""), fallback_stage=1, addendum=member.get("persona_addendum")
+            ),
         )
         for member in COUNCIL_MEMBERS
     }
@@ -239,7 +241,9 @@ async def stage2_collect_rankings(
     model_to_messages = {
         member["model_id"]: build_messages(
             ranking_prompt,
-            persona=persona_for_member(member.get("persona", ""), fallback_stage=2),
+            persona=persona_for_member(
+                member.get("persona", ""), fallback_stage=2, addendum=member.get("persona_addendum")
+            ),
         )
         for member in COUNCIL_MEMBERS
     }
@@ -355,7 +359,9 @@ async def stage3_synthesize_final(
 
     messages = build_messages(
         chairman_prompt,
-        persona=persona_for_member(CHAIRMAN_MEMBER.get("persona", ""), fallback_stage=3),
+        persona=persona_for_member(
+            CHAIRMAN_MEMBER.get("persona", ""), fallback_stage=3, addendum=CHAIRMAN_MEMBER.get("persona_addendum")
+        ),
     )
     try:
         response = await asyncio.wait_for(
@@ -497,7 +503,15 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
         "event": "council.run.start",
         "run_id": run_id,
         "user_query_len": len(user_query or ""),
-        "council_members": [{"name": m.get("name"), "model_id": m.get("model_id"), "persona": m.get("persona")} for m in COUNCIL_MEMBERS],
+        "council_members": [
+            {
+                "name": m.get("name"),
+                "model_id": m.get("model_id"),
+                "persona": m.get("persona"),
+                "persona_addendum": m.get("persona_addendum"),
+            }
+            for m in COUNCIL_MEMBERS
+        ],
         "chairman_model": CHAIRMAN_MODEL,
     })
 

@@ -9,7 +9,7 @@ Design goals:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass, replace
 from typing import Dict, List, Optional, Iterable
 
 
@@ -126,6 +126,26 @@ def get_persona(name: str, default: Optional[Persona] = None) -> Persona:
 
 
 # ----------------------------
+
+def apply_persona_addendum(persona: Persona, addendum: Optional[str]) -> Persona:
+    """Append an optional per-member addendum to a Persona's system prompt.
+
+    This keeps base personas reusable while allowing council members to inject uniqueness.
+    """
+    if not addendum:
+        return persona
+
+    suffix = "\n\n---\n## Member addendum\n" + addendum.strip() + "\n"
+
+    # Persona is a frozen dataclass; return a new instance with updated system_prompt.
+    if is_dataclass(persona):
+        return replace(persona, system_prompt=(persona.system_prompt or "") + suffix)
+
+    # Fallback (shouldn't usually happen, but keeps things robust).
+    return Persona(name=persona.name, system_prompt=(persona.system_prompt or "") + suffix)
+
+
+# ----------------------------
 # Message builders
 # ----------------------------
 
@@ -151,12 +171,14 @@ def build_messages(
     ]
 
 
-def persona_for_member(persona_name: str, *, fallback_stage: int = 1) -> Persona:
-    """Resolve a member's persona by unique name, with a stage-based fallback."""
+def persona_for_member(persona_name: str, *, fallback_stage: int = 1, addendum: Optional[str] = None) -> Persona:
+    """Resolve a member's persona by unique name, with a stage-based fallback, then apply any addendum."""
     try:
-        return get_persona(persona_name)
+        persona = get_persona(persona_name)
     except KeyError:
-        return persona_for_stage(fallback_stage)
+        persona = persona_for_stage(fallback_stage)
+
+    return apply_persona_addendum(persona, addendum)
 
 
 def persona_for_stage(stage: int, model: Optional[str] = None) -> Persona:
