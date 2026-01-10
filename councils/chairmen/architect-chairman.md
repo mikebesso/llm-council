@@ -1,6 +1,6 @@
 +++
 name = "Chaiman Architect"
-model_id = "openai/gpt-5.2"
+model_id = "google/gemini-3-pro-preview"
 persona = "systems-architect"
 +++
 

@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Tuple, Optional
 # These prevent the council from being held hostage by a single slow/blocked provider.
 STAGE1_WALL_TIMEOUT_S = 45.0
 STAGE2_WALL_TIMEOUT_S = 60.0
-STAGE3_WALL_TIMEOUT_S = 60.0
+STAGE3_WALL_TIMEOUT_S = 120.0
 
 # Per-request timeout passed to OpenRouter (seconds)
 MODEL_TIMEOUT_S = 120.0
@@ -122,66 +122,66 @@ async def stage1_collect_responses(user_query: str, run_id: Optional[str] = None
         "expected_count": len(COUNCIL_MEMBERS),
     })
 
-    model_to_messages = {
-        member["model_id"]: build_messages(
+    # Fan out per-member calls (NOT per model_id). Multiple council members may share a model.
+    member_tasks: List[Tuple[Dict[str, Any], asyncio.Task]] = []
+    for member in COUNCIL_MEMBERS:
+        model_id = str(member.get("model_id") or "")
+        msgs = build_messages(
             user_query,
             persona=persona_for_member(
-                member.get("persona", ""), fallback_stage=1, addendum=member.get("persona_addendum")
+                member.get("persona", ""),
+                fallback_stage=1,
+                addendum=member.get("persona_addendum"),
             ),
         )
-        for member in COUNCIL_MEMBERS
-    }
-
-    # Fan out per-model calls with a wall-clock timeout so we can return partial results.
-    tasks = {
-        model: asyncio.create_task(
-            query_model(model, msgs, timeout=MODEL_TIMEOUT_S, run_id=run_id)
+        member_tasks.append(
+            (member, asyncio.create_task(query_model(model_id, msgs, timeout=MODEL_TIMEOUT_S, run_id=run_id)))
         )
-        for model, msgs in model_to_messages.items()
-    }
 
     done, pending = await asyncio.wait(
-        tasks.values(),
+        [t for (_m, t) in member_tasks],
         timeout=STAGE1_WALL_TIMEOUT_S,
     )
 
     # Cancel any stragglers so they don't leak work in a long-lived server.
-    pending_models = []
-    for model, task in tasks.items():
+    pending_members: List[Dict[str, str]] = []
+    for member, task in member_tasks:
         if task in pending:
-            pending_models.append(model)
+            pending_members.append({
+                "member_name": str(member.get("name") or "Member"),
+                "model_id": str(member.get("model_id") or ""),
+            })
             task.cancel()
 
-    if pending_models:
+    if pending_members:
         log_event({
             "event": "council.stage1.timeout",
             "run_id": run_id,
             "wall_timeout_s": STAGE1_WALL_TIMEOUT_S,
-            "pending_models": pending_models,
+            "pending_members": pending_members,
         })
 
-    responses: Dict[str, Optional[Dict[str, Any]]] = {}
-    for model, task in tasks.items():
+    stage1_results: List[Dict[str, Any]] = []
+    for member, task in member_tasks:
         if task in done:
             try:
-                responses[model] = task.result()
+                response = task.result()
             except Exception as e:
-                responses[model] = None
                 log_event({
                     "event": "council.stage1.task_error",
                     "run_id": run_id,
-                    "model": model,
+                    "model": str(member.get("model_id") or ""),
+                    "member_name": str(member.get("name") or "Member"),
                     "error": str(e)[:200],
                 })
-        else:
-            responses[model] = None
+                continue
 
-    stage1_results: List[Dict[str, Any]] = []
-    for model, response in responses.items():
-        if response is not None:
-            member_name = _member_name_for_model_id(model, fallback="Member")
+            if response is None:
+                continue
+
+            member_name = str(member.get("name") or "Member")
             persona_name = persona_for_member(
-                next((m.get("persona") for m in COUNCIL_MEMBERS if m.get("model_id") == model), ""),
+                member.get("persona", ""),
                 fallback_stage=1,
             ).name
             stage1_results.append({
@@ -193,7 +193,7 @@ async def stage1_collect_responses(user_query: str, run_id: Optional[str] = None
                 "response": response.get("content", ""),
                 "run_id": run_id,
                 # TODO: Move model identifiers to an appendix/debug view rather than the conversation UX.
-                "model_id": model,
+                "model_id": str(member.get("model_id") or ""),
             })
 
     log_event({
@@ -238,67 +238,67 @@ async def stage2_collect_rankings(
 
     ranking_prompt = build_stage2_ranking_prompt(user_query=user_query, responses_text=responses_text)
 
-    model_to_messages = {
-        member["model_id"]: build_messages(
+    # Fan out per-member judge calls (NOT per model_id). Multiple council members may share a model.
+    member_tasks: List[Tuple[Dict[str, Any], asyncio.Task]] = []
+    for member in COUNCIL_MEMBERS:
+        model_id = str(member.get("model_id") or "")
+        msgs = build_messages(
             ranking_prompt,
             persona=persona_for_member(
-                member.get("persona", ""), fallback_stage=2, addendum=member.get("persona_addendum")
+                member.get("persona", ""),
+                fallback_stage=2,
+                addendum=member.get("persona_addendum"),
             ),
         )
-        for member in COUNCIL_MEMBERS
-    }
-
-    # Fan out per-model judge calls with a wall-clock timeout so we can return partial results.
-    tasks = {
-        model: asyncio.create_task(
-            query_model(model, msgs, timeout=MODEL_TIMEOUT_S, run_id=run_id)
+        member_tasks.append(
+            (member, asyncio.create_task(query_model(model_id, msgs, timeout=MODEL_TIMEOUT_S, run_id=run_id)))
         )
-        for model, msgs in model_to_messages.items()
-    }
 
     done, pending = await asyncio.wait(
-        tasks.values(),
+        [t for (_m, t) in member_tasks],
         timeout=STAGE2_WALL_TIMEOUT_S,
     )
 
-    pending_models = []
-    for model, task in tasks.items():
+    pending_members: List[Dict[str, str]] = []
+    for member, task in member_tasks:
         if task in pending:
-            pending_models.append(model)
+            pending_members.append({
+                "member_name": str(member.get("name") or "Judge"),
+                "model_id": str(member.get("model_id") or ""),
+            })
             task.cancel()
 
-    if pending_models:
+    if pending_members:
         log_event({
             "event": "council.stage2.timeout",
             "run_id": run_id,
             "wall_timeout_s": STAGE2_WALL_TIMEOUT_S,
-            "pending_models": pending_models,
+            "pending_members": pending_members,
         })
 
-    responses: Dict[str, Optional[Dict[str, Any]]] = {}
-    for model, task in tasks.items():
+    stage2_results: List[Dict[str, Any]] = []
+    for member, task in member_tasks:
         if task in done:
             try:
-                responses[model] = task.result()
+                response = task.result()
             except Exception as e:
-                responses[model] = None
                 log_event({
                     "event": "council.stage2.task_error",
                     "run_id": run_id,
-                    "model": model,
+                    "model": str(member.get("model_id") or ""),
+                    "member_name": str(member.get("name") or "Judge"),
                     "error": str(e)[:200],
                 })
-        else:
-            responses[model] = None
+                continue
 
-    stage2_results: List[Dict[str, Any]] = []
-    for model, response in responses.items():
-        if response is not None:
+            if response is None:
+                continue
+
             full_text = response.get("content", "")
             parsed = parse_ranking_from_text(full_text)
-            member_name = _member_name_for_model_id(model, fallback="Judge")
+            member_name = str(member.get("name") or "Judge")
             persona_name = persona_for_member(
-                next((m.get("persona") for m in COUNCIL_MEMBERS if m.get("model_id") == model), ""),
+                member.get("persona", ""),
                 fallback_stage=2,
             ).name
             stage2_results.append({
@@ -309,7 +309,7 @@ async def stage2_collect_rankings(
                 "parsed_ranking": parsed,
                 "run_id": run_id,
                 # TODO: Move model identifiers to an appendix/debug view rather than the conversation UX.
-                "model_id": model,
+                "model_id": str(member.get("model_id") or ""),
             })
 
     log_event({

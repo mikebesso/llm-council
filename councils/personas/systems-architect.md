@@ -1,3 +1,9 @@
++++
+id = "systems-architect"
+title = "Systems Architect"
+version = "1.0"
++++
+
 # Persona: Systems Architect
 
 ## Category

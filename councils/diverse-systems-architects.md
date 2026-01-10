@@ -1,9 +1,9 @@
 +++
-chairman = "architect-charmain"
+chairman = "architect-chairman"
 members = [
   "architect-aws",
   "architect-azure",
-  "systems-google"
+  "architect-google"
 ]
 +++
 
