@@ -1,6 +1,6 @@
 +++
 name = "AWS Architect"
-model_id = "openai/gpt-5.2"
+model_id = "deepseek/deepseek-r1"
 persona = "systems-architect"
 +++
 

@@ -43,16 +43,27 @@ def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _parse_toml_front_matter(md_text: str, *, source: str) -> Tuple[Dict[str, Any], str]:
+def _parse_toml_front_matter(
+    md_text: str, *, source: str, require: bool = True
+) -> Tuple[Dict[str, Any], str]:
     """Parse TOML front matter delimited by +++ ... +++ in a markdown file.
+
+    If `require` is False and the file does not start with +++, returns ({}, full_text).
 
     Returns: (front_matter_dict, body_text)
     """
     lines = md_text.splitlines()
+
+    # Optional front matter support (useful for simple persona markdown files).
     if not lines or lines[0].strip() != "+++":
-        msg = f"CONFIG ERROR: {source} is missing TOML front matter start delimiter (+++)."
-        logger.error(msg)
-        raise RuntimeError(msg)
+        if require:
+            msg = (
+                f"CONFIG ERROR: {source} is missing TOML front matter start delimiter (+++)."
+            )
+            logger.error(msg)
+            raise RuntimeError(msg)
+        # No front matter; treat whole file as body.
+        return {}, md_text.lstrip("\n")
 
     end_idx: Optional[int] = None
     for i in range(1, len(lines)):
@@ -97,7 +108,7 @@ def _require_key(d: Dict[str, Any], key: str, *, source: str) -> Any:
 def _load_persona_prompt(persona_id: str) -> str:
     persona_file = COUNCILS_DIR / "personas" / f"{persona_id}.md"
     md = _read_text(persona_file)
-    fm, body = _parse_toml_front_matter(md, source=str(persona_file))
+    fm, body = _parse_toml_front_matter(md, source=str(persona_file), require=False)
     # Persona content is the markdown body; front matter is optional metadata.
     if not body.strip():
         msg = f"CONFIG ERROR: Persona file has empty body: {persona_file}"
