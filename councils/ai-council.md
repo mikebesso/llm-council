@@ -4,7 +4,7 @@ members = [
   "architect-ai",
   "futurist-ai",
   "governance-ai",
-  "futurist-ai",
+  "engineer-ai",
   "researcher-ai"
 ]
 +++

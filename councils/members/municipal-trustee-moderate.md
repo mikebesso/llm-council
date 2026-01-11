@@ -1,5 +1,5 @@
 +++
-name = "Trustee"
+name = "Trustee (Moderate)"
 persona = "legislator"
 model_id = "openai/gpt-4.1-nano"
 +++

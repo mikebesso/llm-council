@@ -1,5 +1,5 @@
 +++
-name = "Trustee"
+name = "Trustee (Liberal)"
 persona = "legislator"
 model_id = "anthropic/claude-sonnet-4.5"
 +++

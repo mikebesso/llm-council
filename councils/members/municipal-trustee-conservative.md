@@ -1,5 +1,5 @@
 +++
-name = "Trustee"
+name = "Trustee (Conservative)"
 persona = "legislator"
 model_id = "google/gemini-2.0-flash-001"
 +++

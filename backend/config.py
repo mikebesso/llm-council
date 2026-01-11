@@ -12,7 +12,8 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # Ensure we load .env from the project root (not CWD).
-load_dotenv(PROJECT_ROOT / ".env")
+load_dotenv(PROJECT_ROOT / ".env", override=True)
+
 
 # Council metadata lives in the project root (sibling of backend/).
 COUNCILS_DIR = PROJECT_ROOT / "councils"
