@@ -1,0 +1,10 @@
+{
+    "python.testing.pytestArgs": [
+        "backend/tests"
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true,
+    "terminal.integrated.cwd": "${workspaceFolder}",
+    "python.testing.cwd": "${workspaceFolder}",
+    "python.analysis.extraPaths": ["${workspaceFolder}"]
+}

@@ -144,6 +144,18 @@ class SendMessageRequest(BaseModel):
     """Request to send a message in a conversation."""
     content: str
 
+    # MVP: prompt-runner controls (optional; defaults apply when omitted)
+    council: str | None = None
+    stages: List[int] | None = None
+
+
+class RunPromptRequest(BaseModel):
+    """Request to run a standalone prompt (no conversation persistence)."""
+    content: str
+    council: str | None = None
+    stages: List[int] | None = None
+    prompt_id: str | None = None
+    title: str | None = None
 
 class ConversationMetadata(BaseModel):
     """Conversation metadata for list view."""
@@ -212,14 +224,43 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         title = await generate_conversation_title(request.content)
         storage.update_conversation_title(conversation_id, title)
 
-    # Run the 3-stage council process
+    stages = _normalize_stages(request.stages)
+
+    async def _run_selected_stages():
+        # MVP: council selection is recorded but not yet applied.
+        stage1_results = None
+        stage2_results = None
+        stage3_result = None
+
+        if 1 in stages:
+            stage1_results = await stage1_collect_responses(request.content)
+
+        if 2 in stages:
+            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
+            aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+        else:
+            label_to_model = None
+            aggregate_rankings = None
+
+        if 3 in stages:
+            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+
+        metadata = {
+            "execution": _build_execution_metadata(council=request.council, stages=stages),
+            "label_to_model": label_to_model,
+            "aggregate_rankings": aggregate_rankings,
+        }
+        return stage1_results, stage2_results, stage3_result, metadata
+
     stage1_results, stage2_results, stage3_result, metadata = await _retry_once_on_transient(
-        lambda: run_full_council(request.content),
+        _run_selected_stages,
         context={
             "conversation_id": conversation_id,
             "path": "/api/conversations/{conversation_id}/message",
+            "requested_council": request.council,
+            "requested_stages": stages,
         },
-    )
+    )   
 
     # Add assistant message with all stages
     storage.add_assistant_message(
@@ -237,6 +278,121 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         "metadata": metadata
     })
 
+def _normalize_stages(stages: List[int] | None) -> List[int]:
+    """Normalize stages to a sorted list from {1,2,3}. Defaults to [1,2,3]."""
+    if not stages:
+        return [1, 2, 3]
+
+    try:
+        normalized = sorted(set(int(s) for s in stages))
+    except Exception:
+        raise HTTPException(status_code=400, detail="stages must be a list of integers")
+
+    allowed = {1, 2, 3}
+    if any(s not in allowed for s in normalized):
+        raise HTTPException(status_code=400, detail="stages must be a subset of [1,2,3]")
+
+    # Enforce dependencies: stage2 requires stage1; stage3 requires stage1+stage2
+    if 2 in normalized and 1 not in normalized:
+        raise HTTPException(status_code=400, detail="stage2 requires stage1")
+    if 3 in normalized and (1 not in normalized or 2 not in normalized):
+        raise HTTPException(status_code=400, detail="stage3 requires stages 1 and 2")
+
+    return normalized
+
+
+def _build_execution_metadata(*, council: str | None, stages: List[int]) -> dict:
+    """MVP metadata describing how the run was executed."""
+    return {
+        "requested_council": council,
+        "requested_stages": stages,
+        # MVP: council selection is recorded but not yet plumbed into the runner.
+        "council_applied": None,
+        "stages_executed": stages,
+    }
+
+
+@app.post("/api/prompts/run")
+async def run_prompt(request: RunPromptRequest):
+    """Run a standalone prompt and persist the result like a conversation."""
+    stages = _normalize_stages(request.stages)
+
+    # Use provided prompt_id as the conversation id when available; otherwise generate one.
+    conversation_id = request.prompt_id or str(uuid.uuid4())
+
+    # Ensure a conversation file exists.
+    conversation = storage.get_conversation(conversation_id)
+    if conversation is None:
+        conversation = storage.create_conversation(conversation_id)
+
+    # Detect first message (for title generation)
+    is_first_message = len(conversation.get("messages", [])) == 0
+
+    # Add user message
+    storage.add_user_message(conversation_id, request.content)
+
+    # Title handling: prefer explicit title; else generate on first message.
+    if request.title:
+        storage.update_conversation_title(conversation_id, request.title)
+    elif is_first_message:
+        title = await generate_conversation_title(request.content)
+        storage.update_conversation_title(conversation_id, title)
+
+    async def _run_selected_stages():
+        stage1_results = None
+        stage2_results = None
+        stage3_result = None
+
+        if 1 in stages:
+            stage1_results = await stage1_collect_responses(request.content)
+
+        if 2 in stages:
+            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
+            aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+        else:
+            label_to_model = None
+            aggregate_rankings = None
+
+        if 3 in stages:
+            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+
+        metadata = {
+            "execution": _build_execution_metadata(council=request.council, stages=stages),
+            "prompt_id": request.prompt_id,
+            "title": request.title,
+            "label_to_model": label_to_model,
+            "aggregate_rankings": aggregate_rankings,
+        }
+
+        return stage1_results, stage2_results, stage3_result, metadata
+
+    stage1_results, stage2_results, stage3_result, metadata = await _retry_once_on_transient(
+        _run_selected_stages,
+        context={
+            "conversation_id": conversation_id,
+            "path": "/api/prompts/run",
+            "prompt_id": request.prompt_id,
+            "requested_council": request.council,
+            "requested_stages": stages,
+        },
+    )
+
+    # Persist assistant message with all stages (same as conversation endpoint)
+    storage.add_assistant_message(
+        conversation_id,
+        stage1_results,
+        stage2_results,
+        stage3_result,
+    )
+
+    return _sanitize_for_conversation({
+        "conversation_id": conversation_id,
+        "stage1": stage1_results,
+        "stage2": stage2_results,
+        "stage3": stage3_result,
+        "metadata": metadata,
+    })
+
 
 @app.post("/api/conversations/{conversation_id}/message/stream")
 async def send_message_stream(conversation_id: str, request: SendMessageRequest, http_request: Request):
@@ -251,6 +407,8 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest,
 
     # Check if this is the first message
     is_first_message = len(conversation["messages"]) == 0
+
+    stages = _normalize_stages(request.stages)
 
     async def event_generator():
         run_id = None
@@ -278,75 +436,91 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest,
                 title_task = asyncio.create_task(generate_conversation_title(request.content))
 
             # Stage 1: Collect responses
-            yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            await _raise_if_disconnected(http_request)
-            stage1_results = await _retry_once_on_transient(
-                lambda: stage1_collect_responses(request.content),
-                context={
+            stage1_results = None
+            if 1 in stages:
+                yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
+                await _raise_if_disconnected(http_request)
+                stage1_results = await _retry_once_on_transient(
+                    lambda: stage1_collect_responses(request.content),
+                    context={
+                        "conversation_id": conversation_id,
+                        "stage": 1,
+                        "requested_council": request.council,
+                        "requested_stages": stages,
+                    },
+                )
+                await _raise_if_disconnected(http_request)
+
+                # Derive run_id from stage1 results (stage1 attaches run_id to each result)
+                try:
+                    if stage1_results and isinstance(stage1_results, list):
+                        run_id = stage1_results[0].get("run_id")
+                except Exception:
+                    run_id = run_id
+
+                if run_id:
+                    set_run_id(run_id)
+
+                log_event({
+                    "event": "api.stream.stage1.done",
+                    "run_id": run_id,
                     "conversation_id": conversation_id,
-                    "stage": 1,
-                },
-            )
-            await _raise_if_disconnected(http_request)
+                    "stage1_count": len(stage1_results) if stage1_results else 0,
+                })
 
-            # Derive run_id from stage1 results (stage1 attaches run_id to each result)
-            try:
-                if stage1_results and isinstance(stage1_results, list):
-                    run_id = stage1_results[0].get("run_id")
-            except Exception:
-                run_id = run_id
-
-            if run_id:
-                set_run_id(run_id)
-
-            log_event({
-                "event": "api.stream.stage1.done",
-                "run_id": run_id,
-                "conversation_id": conversation_id,
-                "stage1_count": len(stage1_results) if stage1_results else 0,
-            })
-
-            yield f"data: {json.dumps({'type': 'stage1_complete', 'data': _sanitize_for_conversation(stage1_results)})}\n\n"
-
+                yield f"data: {json.dumps({'type': 'stage1_complete', 'data': _sanitize_for_conversation(stage1_results)})}\n\n"
+                
             # Stage 2: Collect rankings
-            yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            await _raise_if_disconnected(http_request)
-            stage2_results, label_to_model = await _retry_once_on_transient(
-                lambda: stage2_collect_rankings(request.content, stage1_results),
-                context={
+            stage2_results = None
+            label_to_model = None
+            aggregate_rankings = None
+            if 2 in stages:
+                yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
+                await _raise_if_disconnected(http_request)
+                stage2_results, label_to_model = await _retry_once_on_transient(
+                    lambda: stage2_collect_rankings(request.content, stage1_results),
+                    context={
+                        "conversation_id": conversation_id,
+                        "stage": 2,
+                        "requested_council": request.council,
+                        "requested_stages": stages,
+                    },
+                )
+                await _raise_if_disconnected(http_request)
+                aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+                log_event({
+                    "event": "api.stream.stage2.done",
+                    "run_id": run_id,
                     "conversation_id": conversation_id,
-                    "stage": 2,
-                },
-            )
-            await _raise_if_disconnected(http_request)
-            aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
-            log_event({
-                "event": "api.stream.stage2.done",
-                "run_id": run_id,
-                "conversation_id": conversation_id,
-                "stage2_count": len(stage2_results) if stage2_results else 0,
-                "aggregate_count": len(aggregate_rankings) if aggregate_rankings else 0,
-            })
-            yield f"data: {json.dumps({'type': 'stage2_complete', 'data': _sanitize_for_conversation(stage2_results), 'metadata': _sanitize_for_conversation({'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings})})}\n\n"
-
+                    "stage2_count": len(stage2_results) if stage2_results else 0,
+                    "aggregate_count": len(aggregate_rankings) if aggregate_rankings else 0,
+                })
+                yield f"data: {json.dumps({'type': 'stage2_complete', 'data': _sanitize_for_conversation(stage2_results), 'metadata': _sanitize_for_conversation({'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings})})}\n\n"
+                
             # Stage 3: Synthesize final answer
-            yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            await _raise_if_disconnected(http_request)
-            stage3_result = await _retry_once_on_transient(
-                lambda: stage3_synthesize_final(request.content, stage1_results, stage2_results),
-                context={
+            stage3_result = None
+            if 3 in stages:
+                yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
+                await _raise_if_disconnected(http_request)
+                stage3_result = await _retry_once_on_transient(
+                    lambda: stage3_synthesize_final(request.content, stage1_results, stage2_results),
+                    context={
+                        "conversation_id": conversation_id,
+                        "stage": 3,
+                        "requested_council": request.council,
+                        "requested_stages": stages,
+                    },
+                )
+                await _raise_if_disconnected(http_request)
+                log_event({
+                    "event": "api.stream.stage3.done",
+                    "run_id": run_id,
                     "conversation_id": conversation_id,
-                    "stage": 3,
-                },
-            )
-            await _raise_if_disconnected(http_request)
-            log_event({
-                "event": "api.stream.stage3.done",
-                "run_id": run_id,
-                "conversation_id": conversation_id,
-                "final_len": len((stage3_result or {}).get("response") or ""),
-            })
-            yield f"data: {json.dumps({'type': 'stage3_complete', 'data': _sanitize_for_conversation(stage3_result)})}\n\n"
+                    "final_len": len((stage3_result or {}).get("response") or ""),
+                })
+                yield f"data: {json.dumps({'type': 'stage3_complete', 'data': _sanitize_for_conversation(stage3_result)})}\n\n"
+                
+                yield f"data: {json.dumps({'type': 'execution', 'metadata': _sanitize_for_conversation({'execution': _build_execution_metadata(council=request.council, stages=stages)})})}\n\n"
 
             # Wait for title generation if it was started
             if title_task:

@@ -1,0 +1,35 @@
+# Prompt configuration schema (v1)
+# This file is OPTIONAL.
+# If absent, the runner will execute the prompt using defaults.
+
+version = "1.0"
+
+# Stable identifier for this prompt product
+id = "leap-year-and-network-days"
+
+# Human-friendly name
+title = "Leap Year and Network Days Challenges"
+
+# Allows prompts to be disabled without deletion
+enabled = true
+
+# Free-form categorization
+tags = ["math", "calendar"]
+
+# ---------------------------------
+# Execution controls
+# ---------------------------------
+[execution]
+
+# Council to use for this prompt.
+# If omitted, the environment default council is used.
+council = "ai-council"
+
+# Stages to execute (defaults apply if omitted)
+stages = [1, 2, 3]
+
+# Optional priority for batch execution
+priority = 50
+
+# Optional seed for deterministic sampling
+seed = 12345
