@@ -69,7 +69,5 @@ The engine renders the prompt by concatenating these parts in order:
 3. **User Query** (`user_query`)
 4. **Task** (`instructions`)
 
-## Notes on placeholders
 
-- `council_prompt` replaces the older `{council-mission}` placeholder.
-- `improved_query` is optional and is not included by default. If we decide the delegate stage should use it explicitly, we can add an `improved_query` part above `user_query`.
+

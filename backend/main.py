@@ -121,7 +121,14 @@ def _sanitize_for_conversation(payload):
 from .observability import log_event, set_run_id
 
 from . import storage
-from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
+from .council import (
+    run_full_council,
+    generate_conversation_title,
+    stage1_collect_responses,
+    stage2_collect_rankings,
+    stage3_synthesize_final,
+    calculate_aggregate_rankings,
+)
 
 app = FastAPI(title="LLM Council API")
 
@@ -227,28 +234,30 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     stages = _normalize_stages(request.stages)
 
     async def _run_selected_stages():
-        # MVP: council selection is recorded but not yet applied.
-        stage1_results = None
-        stage2_results = None
-        stage3_result = None
+        # Run the full council once using the selected council id.
+        # For now, even if the caller requests a subset of stages, we run all 3
+        # and then omit unrequested results in the response.
+        council_id = request.council or "ai-council"
+        stage1_results, stage2_results, stage3_result, council_meta = await run_full_council(
+            request.content,
+            council_id=council_id,
+        )
 
-        if 1 in stages:
-            stage1_results = await stage1_collect_responses(request.content)
-
-        if 2 in stages:
-            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
-            aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
-        else:
-            label_to_model = None
-            aggregate_rankings = None
-
-        if 3 in stages:
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+        # Respect requested stages by omitting unrequested outputs.
+        if 1 not in stages:
+            stage1_results = None
+        if 2 not in stages:
+            stage2_results = None
+            council_meta = {**(council_meta or {}), "label_to_model": None, "aggregate_rankings": None}
+        if 3 not in stages:
+            stage3_result = None
 
         metadata = {
             "execution": _build_execution_metadata(council=request.council, stages=stages),
-            "label_to_model": label_to_model,
-            "aggregate_rankings": aggregate_rankings,
+            "label_to_model": (council_meta or {}).get("label_to_model"),
+            "aggregate_rankings": (council_meta or {}).get("aggregate_rankings"),
+            "run_id": (council_meta or {}).get("run_id"),
+            "council_id": (council_meta or {}).get("council_id") or council_id,
         }
         return stage1_results, stage2_results, stage3_result, metadata
 
@@ -339,29 +348,28 @@ async def run_prompt(request: RunPromptRequest):
         storage.update_conversation_title(conversation_id, title)
 
     async def _run_selected_stages():
-        stage1_results = None
-        stage2_results = None
-        stage3_result = None
+        council_id = request.council or "ai-council"
+        stage1_results, stage2_results, stage3_result, council_meta = await run_full_council(
+            request.content,
+            council_id=council_id,
+        )
 
-        if 1 in stages:
-            stage1_results = await stage1_collect_responses(request.content)
-
-        if 2 in stages:
-            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
-            aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
-        else:
-            label_to_model = None
-            aggregate_rankings = None
-
-        if 3 in stages:
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+        if 1 not in stages:
+            stage1_results = None
+        if 2 not in stages:
+            stage2_results = None
+            council_meta = {**(council_meta or {}), "label_to_model": None, "aggregate_rankings": None}
+        if 3 not in stages:
+            stage3_result = None
 
         metadata = {
             "execution": _build_execution_metadata(council=request.council, stages=stages),
             "prompt_id": request.prompt_id,
             "title": request.title,
-            "label_to_model": label_to_model,
-            "aggregate_rankings": aggregate_rankings,
+            "label_to_model": (council_meta or {}).get("label_to_model"),
+            "aggregate_rankings": (council_meta or {}).get("aggregate_rankings"),
+            "run_id": (council_meta or {}).get("run_id"),
+            "council_id": (council_meta or {}).get("council_id") or council_id,
         }
 
         return stage1_results, stage2_results, stage3_result, metadata

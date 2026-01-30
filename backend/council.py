@@ -1,8 +1,24 @@
-"""3-stage LLM Council orchestration."""
+"""Metadata-driven LLM Council orchestration (workhorse runtime).
+
+Fork B architecture:
+- metadata.py is the dumb data layer (load/parse dataclasses from TOML+Markdown)
+- council.py hydrates runtime actors and executes stages
+
+This module keeps a backward-compatible API surface for the FastAPI endpoints.
+"""
+
+from __future__ import annotations
 
 import asyncio
+import json
 import uuid
-from typing import List, Dict, Any, Tuple, Optional
+import string
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Protocol, Tuple
+
+from .observability import log_event, set_run_id
+from .openrouter import query_model
+from . import metadata as md
 
 # Wall-clock timeouts (seconds) for each stage fan-out.
 # These prevent the council from being held hostage by a single slow/blocked provider.
@@ -13,197 +29,543 @@ STAGE3_WALL_TIMEOUT_S = 120.0
 # Per-request timeout passed to OpenRouter (seconds)
 MODEL_TIMEOUT_S = 120.0
 
-from .openrouter import query_model
-from .config import COUNCIL_MEMBERS, CHAIRMAN_MEMBER, CHAIRMAN_MODEL
-from .personas import build_messages, persona_for_stage, persona_for_member
+# Default council used when callers do not specify one.
+DEFAULT_COUNCIL_ID = "ai-council"
 
 
-from .observability import log_event, set_run_id
+# ------------------------------
+# Model client abstraction
+# ------------------------------
+
+class ModelClient(Protocol):
+    async def query(
+        self,
+        model_id: str,
+        messages: List[Dict[str, str]],
+        *,
+        timeout: float,
+        run_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        ...
 
 
-
-def _member_name_for_model_id(model_id: str, fallback: str = "Member") -> str:
-    """Return the configured council member name for a model_id (no hard-coded names)."""
-    if CHAIRMAN_MEMBER and CHAIRMAN_MEMBER.get("model_id") == model_id:
-        return CHAIRMAN_MEMBER.get("name") or fallback
-
-    for m in COUNCIL_MEMBERS:
-        if m.get("model_id") == model_id:
-            return m.get("name") or fallback
-
-    return fallback
-
-
-# Helper functions for council prompts
-def build_stage2_ranking_prompt(user_query: str, responses_text: str) -> str:
-    """Build the Stage 2 prompt where each model critiques and ranks anonymized responses."""
-
-    # NOTE: This prompt intentionally forces “second-order” and “embodied constraint” checks.
-    # We want the council to notice asymmetric access (e.g., organizers vs attendees),
-    # bio/waste handling, and other operational realities that frequently get missed.
-    return f"""You are evaluating different responses to the following question:
-
-Question: {user_query}
-
-Here are the responses from different models (anonymized):
-
-{responses_text}
-
-Your task:
-1. Evaluate each response individually. For each response, explain what it does well and what it does poorly.
-2. When evaluating quality, you MUST explicitly check for the following common failure modes (and call them out if missing):
-   - Constraint asymmetry: who bears the consequences vs who keeps an escape hatch (e.g., decision-makers retaining access/resources the public does not).
-   - Embodied constraints: biological/physical limits (bathrooms, water, heat/cold, fatigue, mobility, disability access) and dignity impacts.
-   - Second-order logistics: what happens afterward (waste, cleanup, disposal, enforcement residue, transport, bottlenecks).
-   - Incentives and perverse optimizations: density, optics, throughput, or control prioritized over human needs.
-   - One missing operational detail: explicitly name one concrete logistical or operational detail the response fails to address (e.g., waste removal, staffing, enforcement load, cleanup timing, accessibility edge cases).
-3. Then, at the very end of your response, provide a final ranking.
-
-IMPORTANT: Your final ranking MUST be formatted EXACTLY as follows:
-- Start with the line "FINAL RANKING:" (all caps, with colon)
-- Then list the responses from best to worst as a numbered list
-- Each line should be: number, period, space, then ONLY the response label (e.g., "1. Response A")
-- Do not add any other text or explanations in the ranking section
-
-Example of the correct format for your ENTIRE response:
-
-Response A provides good detail on X but misses Y...
-Response B is accurate but lacks depth on Z...
-Response C offers the most comprehensive answer...
-
-FINAL RANKING:
-1. Response C
-2. Response A
-3. Response B
-
-Now provide your evaluation and ranking:"""
+@dataclass
+class OpenRouterModelClient:
+    async def query(
+        self,
+        model_id: str,
+        messages: List[Dict[str, str]],
+        *,
+        timeout: float,
+        run_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        return await query_model(model_id, messages, timeout=timeout, run_id=run_id)
 
 
-def build_stage3_chairman_prompt(user_query: str, stage1_text: str, stage2_text: str) -> str:
-    """Build the Stage 3 prompt where the Chairman synthesizes a final answer."""
+@dataclass
+class MockModelClient:
+    """Deterministic offline client for fast tests/dev."""
 
-    # NOTE: This prompt forces the synthesis to include operational reality checks.
-    return f"""You are the Chairman of an LLM Council. Multiple AI models have provided responses to a user's question, and then ranked each other's responses.
+    prefix: str = "MOCK"
 
-Original Question: {user_query}
+    async def query(
+        self,
+        model_id: str,
+        messages: List[Dict[str, str]],
+        *,
+        timeout: float,
+        run_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        _ = timeout
+        _ = run_id
 
-STAGE 1 - Individual Responses:
-{stage1_text}
+        last_user = ""
+        for m in reversed(messages or []):
+            if m.get("role") == "user":
+                last_user = m.get("content", "")
+                break
 
-STAGE 2 - Peer Rankings:
-{stage2_text}
+        # If the prompt demands JSON, return a minimal valid object.
+        if "Output MUST be valid JSON" in last_user or ("Do not include markdown" in last_user and "JSON" in last_user):
+            return {"content": "{}"}
 
-Your task as Chairman is to synthesize all of this information into a single, comprehensive, accurate answer to the user's original question.
+        return {"content": f"[{self.prefix}:{model_id}] {last_user}".strip()}
 
-In your synthesis, you MUST:
-- Preserve the best insights across the council, but also correct blind spots.
-- Explicitly surface “constraint asymmetry” when present (e.g., organizers/officials retaining bathrooms, exits, water, warmth, or privileges that attendees do not).
-- Include embodied constraints and dignity impacts (humans have bodies; plans must respect biology).
-- Include second-order logistics (waste handling/disposal, cleanup, enforcement residue, downstream bottlenecks).
-- If the discussion implies ad-hoc coping (e.g., diapers), explicitly address the operational consequences (biohazard collection, containment, and disposal) and why that signals a planning failure.
 
-Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
+def _build_messages_simple(user_text: str, *, system_text: str) -> List[Dict[str, str]]:
+    messages: List[Dict[str, str]] = []
+    if system_text:
+        messages.append({"role": "system", "content": system_text})
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+
+# ------------------------------
+# Hydrated runtime actors
+# ------------------------------
+
+@dataclass
+class Member:
+    id: str
+    metadata: md.MemberMetadata
+    persona: md.PersonaMetadata
+
+    @property
+    def name(self) -> str:
+        return self.metadata.name
+
+    @property
+    def model_id(self) -> str:
+        return self.metadata.model_id
+
+
+@dataclass
+class Chairman:
+    id: str
+    metadata: md.ChairmanMetadata
+    persona: md.PersonaMetadata
+
+    @property
+    def name(self) -> str:
+        return self.metadata.name
+
+    @property
+    def model_id(self) -> str:
+        return self.metadata.model_id
+
+
+def _format_template(
+    template: str,
+    context: Dict[str, Any],
+    *,
+    template_label: str,
+    council_id: Optional[str] = None,
+    stage_id: Optional[str] = None,
+) -> str:
+    """Safely format a prompt template with helpful errors.
+
+    We rely on Python's `{name}` format syntax. When a key is missing or a format string is malformed,
+    default exceptions are annoyingly vague during council execution. This wrapper:
+
+    - Detects missing keys and reports them along with available context keys.
+    - Surfaces common user mistakes (e.g., unescaped `{` / `}`) with a clear hint.
+
+    Notes:
+    - Supports basic field names like `{user_query}`.
+    - For advanced fields like `{foo.bar}` or `{foo[0]}`, we validate the root `foo`.
+    """
+
+    if not isinstance(template, str) or not template.strip():
+        raise ValueError(f"Template '{template_label}' is empty")
+
+    # Extract referenced field names from the template so we can preflight missing keys.
+    formatter = string.Formatter()
+    referenced: List[str] = []
+    try:
+        for _literal, field_name, _fmt, _conv in formatter.parse(template):
+            if not field_name:
+                continue
+            # field_name may include indexing/attributes; only validate the root.
+            root = field_name.split(".", 1)[0].split("[", 1)[0]
+            referenced.append(root)
+    except ValueError as e:
+        # Malformed format string (often unmatched braces)
+        where = f"council='{council_id}' stage='{stage_id}' " if (council_id or stage_id) else ""
+        raise ValueError(
+            f"Malformed template in {template_label} ({where}): {e}. "
+            "Hint: if you need a literal '{' or '}', escape it as '{{' or '}}'."
+        ) from e
+
+    missing = sorted({k for k in referenced if k not in context})
+    if missing:
+        where = f"council='{council_id}' stage='{stage_id}' " if (council_id or stage_id) else ""
+        available = ", ".join(sorted(context.keys()))
+        # Show a short snippet so users can find the area without dumping the whole prompt.
+        snippet = template.strip().replace("\n", " ")
+        if len(snippet) > 220:
+            snippet = snippet[:217] + "..."
+        raise KeyError(
+            f"Missing template keys in {template_label} ({where}). "
+            f"Missing: {missing}. Available keys: [{available}]. "
+            f"Template snippet: '{snippet}'."
+        )
+
+    try:
+        return template.format_map(context)
+    except KeyError as e:
+        # KeyError can still occur for nested/indexed fields.
+        key = str(e).strip("'\"")
+        where = f"council='{council_id}' stage='{stage_id}' " if (council_id or stage_id) else ""
+        available = ", ".join(sorted(context.keys()))
+        raise KeyError(
+            f"Template key error in {template_label} ({where}): '{key}'. "
+            f"Available keys: [{available}]."
+        ) from e
+    except ValueError as e:
+        # ValueError often indicates malformed format specifiers.
+        where = f"council='{council_id}' stage='{stage_id}' " if (council_id or stage_id) else ""
+        raise ValueError(
+            f"Template format error in {template_label} ({where}): {e}."
+        ) from e
+
+
+@dataclass
+class Council:
+    id: str
+    metadata: md.CouncilMetadata
+    chairman: Chairman
+    members: List[Member]
+    stages: List[md.StageMetadata]
+
+    @property
+    def name(self) -> str:
+        return self.metadata.name
+
+    def render_stage_prompt(self, stage: md.StageMetadata, *, context: Dict[str, Any]) -> str:
+        """Render a stage prompt.
+
+        Current implementation:
+        - Uses `stage.prompt` if present (from markdown body or frontmatter)
+        - Supports `{key}` formatting via `format_map(context)`
+
+        Stage template 'parts' support can be added later without changing callers.
+        """
+        prompt = getattr(stage, "prompt", "") or ""
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(f"Stage '{stage.id}' has no prompt content")
+        return _format_template(
+            prompt,
+            context,
+            template_label="stage.prompt",
+            council_id=self.id,
+            stage_id=stage.id,
+        )
+
+    async def run(
+        self,
+        user_query: str,
+        *,
+        client: ModelClient,
+        timeout_s: float = MODEL_TIMEOUT_S,
+        run_id: Optional[str] = None,
+        stages_to_run: Optional[List[int]] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+        """Run council stages.
+
+        Returns: (stage1_results, stage2_results, stage3_result, metadata)
+        """
+        if run_id is None:
+            run_id = f"run-{uuid.uuid4()}"
+            set_run_id(run_id)
+            log_event({"event": "council.run.generated", "run_id": run_id, "council_id": self.id})
+
+        stage1_results: List[Dict[str, Any]] = []
+        stage2_results: List[Dict[str, Any]] = []
+        stage3_result: Dict[str, Any] = {}
+
+        # Shared context for prompt rendering
+        ctx: Dict[str, Any] = {
+            "user_query": user_query,
+            "council_prompt": getattr(self.metadata, "prompt", "") or "",
+            "stage_context": "",
+            "responses_text": "",
+            "rankings_text": "",
+            "stage1_text": "",
+            "stage2_text": "",
+        }
+
+        def _refresh_stage_context() -> None:
+            parts: List[str] = []
+            if ctx.get("stage1_text"):
+                parts.append(f"## Stage 1 – Member Responses\n{ctx['stage1_text']}")
+            if ctx.get("stage2_text"):
+                parts.append(f"## Stage 2 – Peer Rankings\n{ctx['stage2_text']}")
+            ctx["stage_context"] = "\n\n".join(parts).strip()
+
+        def _format_stage1_text(rows: List[Dict[str, Any]]) -> str:
+            lines: List[str] = []
+            for i, r in enumerate(rows, start=1):
+                lines.append(f"Member {i}: {r.get('member_name') or r.get('model') or 'member'}")
+                lines.append(r.get("response", ""))
+                lines.append("")
+            return "\n".join(lines).strip()
+
+        def _format_stage2_text(rows: List[Dict[str, Any]]) -> str:
+            lines: List[str] = []
+            for i, r in enumerate(rows, start=1):
+                lines.append(f"Judge {i}: {r.get('member_name') or r.get('model') or 'judge'}")
+                lines.append(r.get("ranking", ""))
+                lines.append("")
+            return "\n".join(lines).strip()
+
+        def _parse_json(content: str) -> Dict[str, Any]:
+            try:
+                obj = json.loads(content)
+                return obj if isinstance(obj, dict) else {}
+            except Exception:
+                return {}
+
+        # Stage selection is still numeric (1/2/3) for API compatibility.
+        stages_to_run_set = set(stages_to_run or [1, 2, 3])
+
+        log_event({
+            "event": "council.run.start",
+            "run_id": run_id,
+            "council_id": self.id,
+            "stages": sorted(list(stages_to_run_set)),
+            "user_query_len": len(user_query or ""),
+            "members": [{"id": m.id, "name": m.name, "model_id": m.model_id, "persona": m.persona.name} for m in self.members],
+            "chairman": {"id": self.chairman.id, "name": self.chairman.name, "model_id": self.chairman.model_id, "persona": self.chairman.persona.name},
+        })
+
+        # We execute stages based on metadata stage ordering.
+        # Convention:
+        # - Stage 1 is the first fanout stage
+        # - Stage 2 is the second fanout stage
+        # - Stage 3 is the first chairman (single) stage after those
+        fanout_seen = 0
+        chairman_seen = 0
+
+        for stage in self.stages:
+            kind = getattr(stage, "kind", "") or ""
+
+            # Fanout stages (per member)
+            if kind == "fanout_members":
+                fanout_seen += 1
+                if fanout_seen == 1 and 1 not in stages_to_run_set:
+                    continue
+                if fanout_seen == 2 and 2 not in stages_to_run_set:
+                    continue
+
+                wall_timeout = STAGE1_WALL_TIMEOUT_S if fanout_seen == 1 else STAGE2_WALL_TIMEOUT_S
+
+                member_tasks: List[Tuple[Member, asyncio.Task]] = []
+                for m in self.members:
+                    persona_prompt = (m.persona.prompt or "").strip()
+                    addendum = (m.metadata.prompt or "").strip()
+                    system_text = f"{persona_prompt}\n\n{addendum}".strip() if addendum else persona_prompt
+
+                    ctx["persona_prompt"] = system_text
+                    prompt = self.render_stage_prompt(stage, context=ctx)
+                    messages = _build_messages_simple(prompt, system_text=system_text)
+                    member_tasks.append((m, asyncio.create_task(client.query(m.model_id, messages, timeout=timeout_s, run_id=run_id))))
+
+                done, pending = await asyncio.wait([t for (_m, t) in member_tasks], timeout=wall_timeout)
+
+                pending_members: List[Dict[str, str]] = []
+                for m, t in member_tasks:
+                    if t in pending:
+                        pending_members.append({"member_name": m.name, "model_id": m.model_id})
+                        t.cancel()
+
+                if pending_members:
+                    log_event({
+                        "event": "council.stage.timeout",
+                        "run_id": run_id,
+                        "stage_id": stage.id,
+                        "wall_timeout_s": wall_timeout,
+                        "pending_members": pending_members,
+                    })
+
+                results: List[Dict[str, Any]] = []
+                for m, t in member_tasks:
+                    if t in done:
+                        try:
+                            r = t.result()
+                        except Exception as e:
+                            log_event({
+                                "event": "council.stage.task_error",
+                                "run_id": run_id,
+                                "stage_id": stage.id,
+                                "member_id": m.id,
+                                "member_name": m.name,
+                                "model_id": m.model_id,
+                                "error": str(e)[:200],
+                            })
+                            continue
+
+                        content = r.get("content", "") if isinstance(r, dict) else ""
+                        results.append({
+                            "model": m.name,  # backward-compatible UI field
+                            "member_name": m.name,
+                            "persona": m.persona.name,
+                            "response" if fanout_seen == 1 else "ranking": content,
+                            "run_id": run_id,
+                            "model_id": m.model_id,
+                        })
+
+                if fanout_seen == 1:
+                    stage1_results = results
+                    ctx["responses_text"] = "\n\n".join([f"{r['member_name']}\n{r.get('response','')}" for r in stage1_results])
+                    ctx["stage1_text"] = _format_stage1_text(stage1_results)
+                else:
+                    # Keep both the raw ranking text and the parsed ranking to preserve prior behavior
+                    stage2_results = []
+                    for r in results:
+                        full_text = r.get("ranking", "")
+                        stage2_results.append({
+                            **r,
+                            "parsed_ranking": parse_ranking_from_text(full_text),
+                        })
+                    ctx["rankings_text"] = "\n\n".join([f"{r['member_name']}\n{r.get('ranking','')}" for r in stage2_results])
+                    ctx["stage2_text"] = _format_stage2_text(stage2_results)
+
+                _refresh_stage_context()
+                continue
+
+            # Chairman stages (single)
+            chairman_seen += 1
+            if chairman_seen == 1 and 3 not in stages_to_run_set:
+                continue
+
+            persona_prompt = (self.chairman.persona.prompt or "").strip()
+            addendum = (self.chairman.metadata.prompt or "").strip()
+            system_text = f"{persona_prompt}\n\n{addendum}".strip() if addendum else persona_prompt
+
+            ctx["persona_prompt"] = system_text
+            prompt = self.render_stage_prompt(stage, context=ctx)
+            messages = _build_messages_simple(prompt, system_text=system_text)
+
+            try:
+                r = await asyncio.wait_for(
+                    client.query(self.chairman.model_id, messages, timeout=timeout_s, run_id=run_id),
+                    timeout=STAGE3_WALL_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                log_event({
+                    "event": "council.stage.timeout",
+                    "run_id": run_id,
+                    "stage_id": stage.id,
+                    "wall_timeout_s": STAGE3_WALL_TIMEOUT_S,
+                    "chairman_model_id": self.chairman.model_id,
+                })
+                r = None
+
+            content = r.get("content", "") if isinstance(r, dict) and r is not None else ""
+
+            # Optional stage semantics by id (kept for existing templates)
+            if stage.id == "improve-prompt":
+                parsed = _parse_json(content)
+                improved = parsed.get("improved_query")
+                if isinstance(improved, str) and improved.strip():
+                    ctx["improved_query"] = improved.strip()
+            elif stage.id == "validate-council-applicability":
+                parsed = _parse_json(content)
+                ctx["council_applicability"] = parsed
+                if isinstance(parsed, dict) and parsed.get("decision") == "STOP":
+                    pretty = json.dumps(parsed, indent=2) if parsed else content
+                    stage3_result = {
+                        "model": self.chairman.name,
+                        "member_name": self.chairman.name,
+                        "persona": self.chairman.persona.name,
+                        "response": pretty,
+                        "model_id": self.chairman.model_id,
+                        "chairman_model_id": self.chairman.model_id,
+                    }
+                    break
+            else:
+                stage3_result = {
+                    "model": self.chairman.name,
+                    "member_name": self.chairman.name,
+                    "persona": self.chairman.persona.name,
+                    "response": content or "Error: Unable to generate final synthesis.",
+                    "model_id": self.chairman.model_id,
+                    "chairman_model_id": self.chairman.model_id,
+                }
+
+            _refresh_stage_context()
+
+        # Label mapping + aggregate rankings are retained for the UI/debug metadata.
+        labels = [chr(65 + i) for i in range(len(stage1_results))]
+        label_to_model = {f"Response {label}": (r.get("member_name") or r.get("model") or f"Member {label}") for label, r in zip(labels, stage1_results)}
+        aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model) if stage2_results else []
+
+        metadata_out = {
+            "label_to_model": label_to_model,
+            "aggregate_rankings": aggregate_rankings,
+            "run_id": run_id,
+            "council_id": self.id,
+        }
+
+        log_event({
+            "event": "council.run.done",
+            "run_id": run_id,
+            "council_id": self.id,
+            "stage1_count": len(stage1_results),
+            "stage2_count": len(stage2_results),
+            "aggregate_count": len(aggregate_rankings),
+            "final_len": len(stage3_result.get("response") or ""),
+        })
+
+        # Clear ambient context for safety (e.g., in long-lived server processes)
+        set_run_id(None)
+
+        return stage1_results, stage2_results, stage3_result, metadata_out
+
+
+# ------------------------------
+# Hydration helpers (Fork B)
+# ------------------------------
+
+def _load_typed(kind: str, id: str) -> md._CouncilMetadata:
+    return md._CouncilMetadata.from_file(kind, id=id)
+
+
+def _load_persona(persona_id: str) -> md.PersonaMetadata:
+    p = _load_typed("persona", persona_id)
+    if not isinstance(p, md.PersonaMetadata):
+        raise TypeError(f"Expected PersonaMetadata for persona '{persona_id}', got {type(p).__name__}")
+    return p
+
+
+def _load_member(member_id: str) -> Member:
+    m = _load_typed("member", member_id)
+    if not isinstance(m, md.MemberMetadata):
+        raise TypeError(f"Expected MemberMetadata for member '{member_id}', got {type(m).__name__}")
+    persona = _load_persona(m.persona)
+    return Member(id=member_id, metadata=m, persona=persona)
+
+
+def _load_chairman(chairman_id: str) -> Chairman:
+    c = _load_typed("chairman", chairman_id)
+    if not isinstance(c, md.ChairmanMetadata):
+        raise TypeError(f"Expected ChairmanMetadata for chairman '{chairman_id}', got {type(c).__name__}")
+    persona = _load_persona(c.persona)
+    return Chairman(id=chairman_id, metadata=c, persona=persona)
+
+
+def _load_stage(stage_id: str) -> md.StageMetadata:
+    s = _load_typed("stage", stage_id)
+    if not isinstance(s, md.StageMetadata):
+        raise TypeError(f"Expected StageMetadata for stage '{stage_id}', got {type(s).__name__}")
+    return s
+
+
+def load_council(council_id: str) -> Council:
+    c = _load_typed("council", council_id)
+    if not isinstance(c, md.CouncilMetadata):
+        raise TypeError(f"Expected CouncilMetadata for council '{council_id}', got {type(c).__name__}")
+
+    chairman = _load_chairman(c.chairman)
+    members = [_load_member(member_id) for member_id in c.members]
+    stages = [_load_stage(stage_id) for stage_id in c.stages]
+
+    return Council(id=council_id, metadata=c, chairman=chairman, members=members, stages=stages)
+
+
+# ------------------------------
+# Backward-compatible public API
+# ------------------------------
 
 async def stage1_collect_responses(user_query: str, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Stage 1: Collect individual responses from all council models."""
-
-    if run_id is None:
-        run_id = f"run-{uuid.uuid4()}"
-        set_run_id(run_id)
-        log_event({
-            "event": "council.run.generated",
-            "run_id": run_id,
-        })
-
-    log_event({
-        "event": "council.stage1.start",
-        "run_id": run_id,
-        "user_query_len": len(user_query or ""),
-        "expected_count": len(COUNCIL_MEMBERS),
-    })
-
-    # Fan out per-member calls (NOT per model_id). Multiple council members may share a model.
-    member_tasks: List[Tuple[Dict[str, Any], asyncio.Task]] = []
-    for member in COUNCIL_MEMBERS:
-        model_id = str(member.get("model_id") or "")
-        msgs = build_messages(
-            user_query,
-            persona=persona_for_member(
-                member.get("persona", ""),
-                fallback_stage=1,
-                addendum=member.get("persona_addendum"),
-            ),
-        )
-        member_tasks.append(
-            (member, asyncio.create_task(query_model(model_id, msgs, timeout=MODEL_TIMEOUT_S, run_id=run_id)))
-        )
-
-    done, pending = await asyncio.wait(
-        [t for (_m, t) in member_tasks],
-        timeout=STAGE1_WALL_TIMEOUT_S,
+    council = load_council(DEFAULT_COUNCIL_ID)
+    s1, _s2, _s3, _meta = await council.run(
+        user_query,
+        client=OpenRouterModelClient(),
+        run_id=run_id,
+        stages_to_run=[1],
     )
-
-    # Cancel any stragglers so they don't leak work in a long-lived server.
-    pending_members: List[Dict[str, str]] = []
-    for member, task in member_tasks:
-        if task in pending:
-            pending_members.append({
-                "member_name": str(member.get("name") or "Member"),
-                "model_id": str(member.get("model_id") or ""),
-            })
-            task.cancel()
-
-    if pending_members:
-        log_event({
-            "event": "council.stage1.timeout",
-            "run_id": run_id,
-            "wall_timeout_s": STAGE1_WALL_TIMEOUT_S,
-            "pending_members": pending_members,
-        })
-
-    stage1_results: List[Dict[str, Any]] = []
-    for member, task in member_tasks:
-        if task in done:
-            try:
-                response = task.result()
-            except Exception as e:
-                log_event({
-                    "event": "council.stage1.task_error",
-                    "run_id": run_id,
-                    "model": str(member.get("model_id") or ""),
-                    "member_name": str(member.get("name") or "Member"),
-                    "error": str(e)[:200],
-                })
-                continue
-
-            if response is None:
-                continue
-
-            member_name = str(member.get("name") or "Member")
-            persona_name = persona_for_member(
-                member.get("persona", ""),
-                fallback_stage=1,
-            ).name
-            stage1_results.append({
-                # Backward-compatible UI field (do not show provider model ids in conversation UX)
-                "model": member_name,
-                # Truthful schema
-                "member_name": member_name,
-                "persona": persona_name,
-                "response": response.get("content", ""),
-                "run_id": run_id,
-                # TODO: Move model identifiers to an appendix/debug view rather than the conversation UX.
-                "model_id": str(member.get("model_id") or ""),
-            })
-
-    log_event({
-        "event": "council.stage1.done",
-        "run_id": run_id,
-        "ok_count": len(stage1_results),
-        "expected_count": len(COUNCIL_MEMBERS),
-    })
-
-    return stage1_results
+    return s1
 
 
 async def stage2_collect_rankings(
@@ -211,115 +573,16 @@ async def stage2_collect_rankings(
     stage1_results: List[Dict[str, Any]],
     run_id: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
-    """Stage 2: Each model ranks the anonymized responses."""
-
-    if run_id is None and stage1_results:
-        run_id = stage1_results[0].get("run_id")
-
-    log_event({
-        "event": "council.stage2.start",
-        "run_id": run_id,
-        "responses_count": len(stage1_results),
-        "expected_count": len(COUNCIL_MEMBERS),
-    })
-
-    labels = [chr(65 + i) for i in range(len(stage1_results))]  # A, B, C, ...
-
-    label_to_model = {
-        f"Response {label}": (result.get("member_name") or result.get("model") or f"Member {label}")
-        for label, result in zip(labels, stage1_results)
-    }
-    # TODO: Provide a separate label_to_model_id mapping for an appendix/debug view.
-
-    responses_text = "\n\n".join([
-        f"Response {label}:\n{result['response']}"
-        for label, result in zip(labels, stage1_results)
-    ])
-
-    ranking_prompt = build_stage2_ranking_prompt(user_query=user_query, responses_text=responses_text)
-
-    # Fan out per-member judge calls (NOT per model_id). Multiple council members may share a model.
-    member_tasks: List[Tuple[Dict[str, Any], asyncio.Task]] = []
-    for member in COUNCIL_MEMBERS:
-        model_id = str(member.get("model_id") or "")
-        msgs = build_messages(
-            ranking_prompt,
-            persona=persona_for_member(
-                member.get("persona", ""),
-                fallback_stage=2,
-                addendum=member.get("persona_addendum"),
-            ),
-        )
-        member_tasks.append(
-            (member, asyncio.create_task(query_model(model_id, msgs, timeout=MODEL_TIMEOUT_S, run_id=run_id)))
-        )
-
-    done, pending = await asyncio.wait(
-        [t for (_m, t) in member_tasks],
-        timeout=STAGE2_WALL_TIMEOUT_S,
+    # NOTE: Stage 2 in the metadata-driven flow is run from scratch to ensure prompt context.
+    # We keep the signature for compatibility but do not reuse the passed stage1_results.
+    council = load_council(DEFAULT_COUNCIL_ID)
+    _s1, s2, _s3, meta = await council.run(
+        user_query,
+        client=OpenRouterModelClient(),
+        run_id=run_id,
+        stages_to_run=[1, 2],
     )
-
-    pending_members: List[Dict[str, str]] = []
-    for member, task in member_tasks:
-        if task in pending:
-            pending_members.append({
-                "member_name": str(member.get("name") or "Judge"),
-                "model_id": str(member.get("model_id") or ""),
-            })
-            task.cancel()
-
-    if pending_members:
-        log_event({
-            "event": "council.stage2.timeout",
-            "run_id": run_id,
-            "wall_timeout_s": STAGE2_WALL_TIMEOUT_S,
-            "pending_members": pending_members,
-        })
-
-    stage2_results: List[Dict[str, Any]] = []
-    for member, task in member_tasks:
-        if task in done:
-            try:
-                response = task.result()
-            except Exception as e:
-                log_event({
-                    "event": "council.stage2.task_error",
-                    "run_id": run_id,
-                    "model": str(member.get("model_id") or ""),
-                    "member_name": str(member.get("name") or "Judge"),
-                    "error": str(e)[:200],
-                })
-                continue
-
-            if response is None:
-                continue
-
-            full_text = response.get("content", "")
-            parsed = parse_ranking_from_text(full_text)
-            member_name = str(member.get("name") or "Judge")
-            persona_name = persona_for_member(
-                member.get("persona", ""),
-                fallback_stage=2,
-            ).name
-            stage2_results.append({
-                "model": member_name,
-                "member_name": member_name,
-                "persona": persona_name,
-                "ranking": full_text,
-                "parsed_ranking": parsed,
-                "run_id": run_id,
-                # TODO: Move model identifiers to an appendix/debug view rather than the conversation UX.
-                "model_id": str(member.get("model_id") or ""),
-            })
-
-    log_event({
-        "event": "council.stage2.done",
-        "run_id": run_id,
-        "ok_count": len(stage2_results),
-        "expected_count": len(COUNCIL_MEMBERS),
-    })
-
-    return stage2_results, label_to_model
+    return s2, meta.get("label_to_model", {})
 
 
 async def stage3_synthesize_final(
@@ -328,103 +591,20 @@ async def stage3_synthesize_final(
     stage2_results: List[Dict[str, Any]],
     run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Stage 3: Chairman synthesizes final response."""
-
-    if run_id is None and stage1_results:
-        run_id = stage1_results[0].get("run_id")
-
-    log_event({
-        "event": "council.stage3.start",
-        "run_id": run_id,
-        "stage1_count": len(stage1_results),
-        "stage2_count": len(stage2_results),
-        "chairman_model": CHAIRMAN_MODEL,
-    })
-
-    stage1_text = "\n\n".join([
-        f"Member: {result.get('member_name') or result.get('model')}\nResponse: {result['response']}"
-        for result in stage1_results
-    ])
-
-    stage2_text = "\n\n".join([
-        f"Member: {result.get('member_name') or result.get('model')}\nRanking: {result['ranking']}"
-        for result in stage2_results
-    ])
-
-    chairman_prompt = build_stage3_chairman_prompt(
-        user_query=user_query,
-        stage1_text=stage1_text,
-        stage2_text=stage2_text,
+    # NOTE: Stage 3 in the metadata-driven flow is run from scratch to ensure prompt context.
+    # We keep the signature for compatibility but do not reuse the passed stage results.
+    council = load_council(DEFAULT_COUNCIL_ID)
+    _s1, _s2, s3, _meta = await council.run(
+        user_query,
+        client=OpenRouterModelClient(),
+        run_id=run_id,
+        stages_to_run=[1, 2, 3],
     )
-
-    messages = build_messages(
-        chairman_prompt,
-        persona=persona_for_member(
-            CHAIRMAN_MEMBER.get("persona", ""), fallback_stage=3, addendum=CHAIRMAN_MEMBER.get("persona_addendum")
-        ),
-    )
-    try:
-        response = await asyncio.wait_for(
-            query_model(CHAIRMAN_MODEL, messages, timeout=MODEL_TIMEOUT_S, run_id=run_id),
-            timeout=STAGE3_WALL_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        log_event({
-            "event": "council.stage3.timeout",
-            "run_id": run_id,
-            "wall_timeout_s": STAGE3_WALL_TIMEOUT_S,
-            "chairman_model": CHAIRMAN_MODEL,
-        })
-        response = None
-
-    if response is None:
-        log_event({
-            "event": "council.stage3.done",
-            "run_id": run_id,
-            "ok": False,
-            "chairman_model": CHAIRMAN_MODEL,
-        })
-        chair_name = _member_name_for_model_id(CHAIRMAN_MODEL, fallback="Chair")
-        chair_persona = persona_for_member(CHAIRMAN_MEMBER.get("persona", ""), fallback_stage=3).name
-        return {
-            "model": chair_name,
-            "member_name": chair_name,
-            "persona": chair_persona,
-            "chairman_model": chair_name,
-            "chairman_member_name": chair_name,
-            "chairman_persona": chair_persona,
-            "response": "Error: Unable to generate final synthesis.",
-            # TODO: Move model identifiers to an appendix/debug view rather than the conversation UX.
-            "model_id": CHAIRMAN_MODEL,
-            "chairman_model_id": CHAIRMAN_MODEL,
-        }
-
-    log_event({
-        "event": "council.stage3.done",
-        "run_id": run_id,
-        "ok": True,
-        "chairman_model": CHAIRMAN_MODEL,
-        "content_len": len(response.get("content") or ""),
-    })
-
-    chair_name = _member_name_for_model_id(CHAIRMAN_MODEL, fallback="Chair")
-    chair_persona = persona_for_member(CHAIRMAN_MEMBER.get("persona", ""), fallback_stage=3).name
-    return {
-        "model": chair_name,
-        "member_name": chair_name,
-        "persona": chair_persona,
-        "chairman_model": chair_name,
-        "chairman_member_name": chair_name,
-        "chairman_persona": chair_persona,
-        "response": response.get("content", ""),
-        # TODO: Move model identifiers to an appendix/debug view rather than the conversation UX.
-        "model_id": CHAIRMAN_MODEL,
-        "chairman_model_id": CHAIRMAN_MODEL,
-    }
+    return s3
 
 
 def parse_ranking_from_text(ranking_text: str) -> List[str]:
-    """Parse the FINAL RANKING section from the model's response."""
+    """Parse the FINAL RANKING section from a model response."""
     import re
 
     if "FINAL RANKING:" in ranking_text:
@@ -442,28 +622,25 @@ def parse_ranking_from_text(ranking_text: str) -> List[str]:
     return matches
 
 
-def calculate_aggregate_rankings(
-    stage2_results: List[Dict[str, Any]],
-    label_to_model: Dict[str, str]
-) -> List[Dict[str, Any]]:
+def calculate_aggregate_rankings(stage2_results: List[Dict[str, Any]], label_to_model: Dict[str, str]) -> List[Dict[str, Any]]:
     """Calculate aggregate rankings across all models."""
     from collections import defaultdict
 
-    model_positions = defaultdict(list)
+    model_positions: Dict[str, List[int]] = defaultdict(list)
 
     for ranking in stage2_results:
-        parsed_ranking = parse_ranking_from_text(ranking["ranking"])
+        parsed_ranking = parse_ranking_from_text(ranking.get("ranking", ""))
         for position, label in enumerate(parsed_ranking, start=1):
             if label in label_to_model:
                 model_name = label_to_model[label]
                 model_positions[model_name].append(position)
 
-    aggregate = []
-    for model, positions in model_positions.items():
+    aggregate: List[Dict[str, Any]] = []
+    for model_name, positions in model_positions.items():
         if positions:
             avg_rank = sum(positions) / len(positions)
             aggregate.append({
-                "model": model,
+                "model": model_name,
                 "average_rank": round(avg_rank, 2),
                 "rankings_count": len(positions),
             })
@@ -475,79 +652,35 @@ def calculate_aggregate_rankings(
 async def generate_conversation_title(user_query: str) -> str:
     """Generate a short title for a conversation based on the first user message."""
 
-    title_prompt = f"""Generate a very short title (3-5 words maximum) that summarizes the following question.
-The title should be concise and descriptive. Do not use quotes or punctuation in the title.
+    title_prompt = (
+        "Generate a very short title (3-5 words maximum) that summarizes the following question.\n"
+        "The title should be concise and descriptive. Do not use quotes or punctuation in the title.\n\n"
+        f"Question: {user_query}\n\nTitle:"
+    )
 
-Question: {user_query}
-
-Title:"""
-
-    messages = build_messages(title_prompt, persona=persona_for_stage(1, "google/gemini-2.5-flash"))
+    messages = _build_messages_simple(title_prompt, system_text="")
     response = await query_model("google/gemini-2.5-flash", messages, timeout=30.0)
 
     if response is None:
         return "New Conversation"
 
-    title = response.get("content", "New Conversation").strip().strip('"\'')
+    title = (response.get("content", "New Conversation") or "New Conversation").strip().strip('"\'')
     if len(title) > 50:
         title = title[:47] + "..."
     return title
 
 
-async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
+async def run_full_council(user_query: str, council_id: str = DEFAULT_COUNCIL_ID) -> Tuple[List, List, Dict, Dict]:
     """Run the complete 3-stage council process."""
 
-    run_id = f"run-{uuid.uuid4()}"
-    set_run_id(run_id)
-    log_event({
-        "event": "council.run.start",
-        "run_id": run_id,
-        "user_query_len": len(user_query or ""),
-        "council_members": [
-            {
-                "name": m.get("name"),
-                "model_id": m.get("model_id"),
-                "persona": m.get("persona"),
-                "persona_addendum": m.get("persona_addendum"),
-            }
-            for m in COUNCIL_MEMBERS
-        ],
-        "chairman_model": CHAIRMAN_MODEL,
-    })
-
-    stage1_results = await stage1_collect_responses(user_query, run_id=run_id)
-
-    if not stage1_results:
-        return [], [], {
-            "model": "error",
-            "response": "All models failed to respond. Please try again.",
-        }, { "run_id": run_id }
-
-    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results, run_id=run_id)
-    aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
-
-    stage3_result = await stage3_synthesize_final(
+    council = load_council(council_id)
+    stage1_results, stage2_results, stage3_result, metadata_out = await council.run(
         user_query,
-        stage1_results,
-        stage2_results,
-        run_id=run_id,
+        client=OpenRouterModelClient(),
+        stages_to_run=[1, 2, 3],
     )
 
-    metadata = {
-        "label_to_model": label_to_model,
-        "aggregate_rankings": aggregate_rankings,
-        "run_id": run_id,
-    }
+    if not stage1_results:
+        return [], [], {"model": "error", "response": "All models failed to respond. Please try again."}, metadata_out
 
-    log_event({
-        "event": "council.run.done",
-        "run_id": run_id,
-        "stage1_count": len(stage1_results),
-        "stage2_count": len(stage2_results),
-        "aggregate_count": len(aggregate_rankings),
-        "final_len": len(stage3_result.get("response") or ""),
-    })
-
-    # Clear ambient context for safety (e.g., in long-lived server processes)
-    set_run_id(None)
-    return stage1_results, stage2_results, stage3_result, metadata
+    return stage1_results, stage2_results, stage3_result, metadata_out

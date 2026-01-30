@@ -16,7 +16,7 @@ load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 
 # Council metadata lives in the project root (sibling of backend/).
-COUNCILS_DIR = PROJECT_ROOT / "councils"
+COUNCILS_DIR = PROJECT_ROOT / "council-metadata"
 
 
 def _require_env_var(name: str) -> str:
@@ -163,7 +163,7 @@ def _load_chairman(chairman_id: str) -> Dict[str, Any]:
 
 
 def _load_council_from_slug(slug: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    council_file = COUNCILS_DIR / f"{slug}.md"
+    council_file = COUNCILS_DIR / "councils" /f"{slug}.md"
     md = _read_text(council_file)
     fm, _body = _parse_toml_front_matter(md, source=str(council_file))
 
