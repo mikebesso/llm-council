@@ -1,3 +1,8 @@
++++
+id = "id"
+name = "name"
++++
+
 # Persona: Quantum Information Researcher
 
 ## Category

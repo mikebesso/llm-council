@@ -1,3 +1,8 @@
++++
+id = "bureaucrat"
+name = "Bureaucrat"
++++
+
 # Persona: Bureaucrat
 
 **Role**: Institutional administrator / process steward

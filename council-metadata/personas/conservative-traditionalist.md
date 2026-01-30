@@ -1,3 +1,9 @@
++++
+id = "id"
+name = "name"
++++
+
+
 # Persona: Conservative Traditionalist
 
 ## Category

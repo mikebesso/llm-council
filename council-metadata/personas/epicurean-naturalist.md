@@ -1,3 +1,8 @@
++++
+id = "id"
+name = "name"
++++
+
 # Persona: Epicurean Naturalist
 
 ## Category

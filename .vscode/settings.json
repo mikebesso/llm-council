@@ -1,10 +1,24 @@
 {
-    "python.testing.pytestArgs": [
-        "backend/tests"
-    ],
-    "python.testing.unittestEnabled": false,
-    "python.testing.pytestEnabled": true,
-    "terminal.integrated.cwd": "${workspaceFolder}",
-    "python.testing.cwd": "${workspaceFolder}",
-    "python.analysis.extraPaths": ["${workspaceFolder}"]
+  "python.testing.pytestArgs": [
+    "backend/tests"
+  ],
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestEnabled": true,
+  "terminal.integrated.cwd": "${workspaceFolder}",
+  "python.testing.cwd": "${workspaceFolder}",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}"
+  ],
+  "python.analysis.typeCheckingMode": "standard",
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportUnknownMemberType": "none",
+    "reportUnknownArgumentType": "none",
+    "reportUnknownParameterType": "none",
+    "reportUnknownLambdaType": "none",
+
+    "reportUnknownVariableType": "warning",
+    "reportUnknownAssignmentType": "warning",
+
+    "reportMissingTypeStubs": "none"
+  }
 }

@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, ClassVar, Protocol, C
 from pathlib import Path
 from dataclasses import dataclass, field
 import json
+
 #
 # --- Stage Template Schema Support ---
 #
@@ -301,16 +302,17 @@ class MockModelClient:
             if m.get("role") == "user":
                 last_user = m.get("content", "")
                 break
-        # Enhanced: If user's prompt requests strict JSON, return minimal valid JSON string
-        # Detect JSON request heuristically
+
+        # Detect explicit JSON-only contract language (avoid false positives on incidental words).
         json_requested = (
             "Output MUST be valid JSON" in last_user
-            or "improved_query" in last_user
-            or "decision" in last_user
+            or ("Do not include markdown" in last_user and "JSON" in last_user)
         )
+
         if json_requested:
-            # improved_query JSON
-            if "improved_query" in last_user:
+            # Two known schemas used by council stages.
+            # 1) improve-prompt schema
+            if "\"improved_query\"" in last_user or "improved_query:" in last_user:
                 payload = {
                     "improved_query": "MOCK: " + (last_user[:200] if last_user else "This is a mock improved query."),
                     "notes": "mock",
@@ -318,8 +320,12 @@ class MockModelClient:
                     "clarifying_questions": [],
                 }
                 return {"content": json.dumps(payload)}
-            # decision JSON
-            if "decision" in last_user and "alternatives" in last_user:
+
+            # 2) validate-council-applicability schema
+            if (
+                ("\"decision\"" in last_user or "decision:" in last_user)
+                and ("\"alternatives\"" in last_user or "alternatives:" in last_user)
+            ):
                 payload = {
                     "applicable": True,
                     "decision": "CONTINUE",
@@ -327,9 +333,11 @@ class MockModelClient:
                     "alternatives": [],
                 }
                 return {"content": json.dumps(payload)}
-            # Unknown JSON request: just return {}
+
+            # Unknown JSON request: return an empty object.
             return {"content": "{}"}
-        # Otherwise, default behavior
+
+        # Otherwise, default behavior: echo the final user prompt for visibility.
         content = f"[{self.prefix}:{model_id}] {last_user}".strip()
         return {"content": content}
 
@@ -533,6 +541,7 @@ class Council:
             "user_query": user_query,
             "council_prompt": self.metadata.prompt,
             "stage_context": "",
+            # legacy / transitional keys (still useful for UI + debugging)
             "responses_text": "",
             "rankings_text": "",
             "stage1_text": "",
@@ -542,35 +551,43 @@ class Council:
         if not self.stages:
             raise RuntimeError(f"Council '{self.id}' has no stages configured")
 
-        def _parse_json_from_content(content: str) -> dict:
+        def _parse_json_from_content(content: str) -> Dict[str, Any]:
             try:
-                return json.loads(content)
+                obj = json.loads(content)
+                return obj if isinstance(obj, dict) else {}
             except Exception:
                 return {}
 
-        for idx, stage in enumerate(self.stages):
-            # Reset prompt and tasks each stage
-            prompt = None
-            tasks = []
-            # Fanout stage: run for each member
+        def _refresh_stage_context() -> None:
+            parts: List[str] = []
+            if ctx.get("stage1_text"):
+                parts.append(f"## Stage 1 – Member Responses\n{ctx['stage1_text']}")
+            if ctx.get("stage2_text"):
+                parts.append(f"## Stage 2 – Peer Reviews\n{ctx['stage2_text']}")
+            ctx["stage_context"] = "\n\n".join(parts).strip()
+
+        for stage in self.stages:
+            # Fanout stages run once per member
             if getattr(stage, "kind", "") == "fanout_members":
-                results = []
+                tasks: List[asyncio.Task] = []
+                rendered_prompts: List[str] = []
+
                 for m in self.members:
-                    ctx["persona_prompt"] = m.persona.prompt + (
-                        ("\n\n" + m.metadata.prompt) if getattr(m.metadata, "prompt", None) else ""
-                    )
+                    addendum = m.metadata.prompt
+                    ctx["persona_prompt"] = f"{m.persona.prompt}\n\n{addendum}" if addendum else m.persona.prompt
+
                     prompt = self.render_stage_prompt(stage.id, context=ctx)
+                    rendered_prompts.append(prompt)
+
                     messages = build_messages_simple(prompt, system_text=ctx["persona_prompt"])
-                    tasks.append(
-                        asyncio.create_task(client.query(m.model_id, messages, timeout=timeout_s))
-                    )
+                    tasks.append(asyncio.create_task(client.query(m.model_id, messages, timeout=timeout_s)))
+
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                # Determine where to store results based on stage id
+
                 if stage.id == "delegate-prompt":
-                    # Stage 1: member responses
                     stage1_results = []
                     for m, r in zip(self.members, results):
-                        if isinstance(r, Exception):
+                        if isinstance(r, BaseException):
                             logger.warning(
                                 "Member query failed",
                                 extra={"council": self.id, "stage": stage.id, "member": m.id, "error": str(r)[:200]},
@@ -582,18 +599,20 @@ class Council:
                                 "member_name": m.name,
                                 "model_id": m.model_id,
                                 "persona": m.persona.name,
-                                "response": (r or {}).get("content", ""),
+                                "response": (r.get("content", "") if isinstance(r, dict) else ""),
                             }
                         )
-                    ctx["responses_text"] = "\n\n".join([
-                        f"{r['member_name']}\n{r['response']}" for r in stage1_results
-                    ])
+
+                    ctx["responses_text"] = "\n\n".join(
+                        [f"{r['member_name']}\n{r['response']}" for r in stage1_results]
+                    )
                     ctx["stage1_text"] = _format_stage1_responses(stage1_results)
+
                 else:
-                    # Peer review/other fanout
+                    # Treat all other fanout stages as “peer review / critique” for now.
                     stage2_results = []
                     for m, r in zip(self.members, results):
-                        if isinstance(r, Exception):
+                        if isinstance(r, BaseException):
                             logger.warning(
                                 "Judge query failed",
                                 extra={"council": self.id, "stage": stage.id, "member": m.id, "error": str(r)[:200]},
@@ -605,60 +624,59 @@ class Council:
                                 "member_name": m.name,
                                 "model_id": m.model_id,
                                 "persona": m.persona.name,
-                                "ranking": (r or {}).get("content", ""),
+                                "ranking": (r.get("content", "") if isinstance(r, dict) else ""),
                             }
                         )
-                    ctx["rankings_text"] = "\n\n".join([
-                        f"{r['member_name']}\n{r['ranking']}" for r in stage2_results
-                    ])
-                    ctx["stage2_text"] = _format_stage2_rankings(stage2_results)
-            else:
-                # Single stage: chairman only
-                ctx["persona_prompt"] = self.chairman.persona.prompt + (
-                    ("\n\n" + self.chairman.metadata.prompt) if getattr(self.chairman.metadata, "prompt", None) else ""
-                )
-                prompt = self.render_stage_prompt(stage.id, context=ctx)
-                messages = build_messages_simple(prompt, system_text=ctx["persona_prompt"])
-                r = await client.query(self.chairman.model_id, messages, timeout=timeout_s)
-                content = (r or {}).get("content", "")
-                # Special handling for certain stages that return JSON
-                if stage.id == "improve-prompt":
-                    # Try to parse improved_query from JSON
-                    parsed = _parse_json_from_content(content)
-                    if isinstance(parsed, dict) and "improved_query" in parsed:
-                        ctx["improved_query"] = parsed["improved_query"]
-                elif stage.id == "validate-council-applicability":
-                    parsed = _parse_json_from_content(content)
-                    ctx["council_applicability"] = parsed
-                    # If decision == STOP, short-circuit the run
-                    if isinstance(parsed, dict) and parsed.get("decision") == "STOP":
-                        # Short-circuit, return what we have
-                        pretty = json.dumps(parsed, indent=2) if parsed else str(content)
-                        return {
-                            "stage1": [],
-                            "stage2": [],
-                            "final": {
-                                "response": pretty,
-                            },
-                        }
-                elif stage.id == "synthesize-output":
-                    # Final synthesis
-                    final_result = {
-                        "id": self.chairman.id,
-                        "member_name": self.chairman.name,
-                        "model_id": self.chairman.model_id,
-                        "persona": self.chairman.persona.name,
-                        "response": content,
-                    }
-                # For other single stages, can extend as needed
 
-            # After each stage, update stage_context as a markdown digest
-            stage_context_parts = []
-            if ctx.get("stage1_text"):
-                stage_context_parts.append(f"## Stage 1 – Member Responses\n{ctx['stage1_text']}")
-            if ctx.get("stage2_text"):
-                stage_context_parts.append(f"## Stage 2 – Peer Reviews\n{ctx['stage2_text']}")
-            ctx["stage_context"] = "\n\n".join(stage_context_parts).strip()
+                    ctx["rankings_text"] = "\n\n".join(
+                        [f"{r['member_name']}\n{r['ranking']}" for r in stage2_results]
+                    )
+                    ctx["stage2_text"] = _format_stage2_rankings(stage2_results)
+
+                _refresh_stage_context()
+                continue
+
+            # Single stages run on the chairman
+            addendum = self.chairman.metadata.prompt
+            ctx["persona_prompt"] = (
+                f"{self.chairman.persona.prompt}\n\n{addendum}" if addendum else self.chairman.persona.prompt
+            )
+
+            prompt = self.render_stage_prompt(stage.id, context=ctx)
+            messages = build_messages_simple(prompt, system_text=ctx["persona_prompt"])
+            r = await client.query(self.chairman.model_id, messages, timeout=timeout_s)
+            content = (r.get("content", "") if isinstance(r, dict) else "")
+
+            if stage.id == "improve-prompt":
+                parsed = _parse_json_from_content(content)
+                improved = parsed.get("improved_query")
+                if isinstance(improved, str) and improved.strip():
+                    ctx["improved_query"] = improved.strip()
+
+            elif stage.id == "validate-council-applicability":
+                parsed = _parse_json_from_content(content)
+                ctx["council_applicability"] = parsed
+                if isinstance(parsed, dict) and parsed.get("decision") == "STOP":
+                    # Short-circuit: return a “final” response explaining why we stopped.
+                    pretty = json.dumps(parsed, indent=2) if parsed else content
+                    return {
+                        "stage1": [],
+                        "stage2": [],
+                        "final": {
+                            "response": pretty,
+                        },
+                    }
+
+            elif stage.id == "synthesize-output":
+                final_result = {
+                    "id": self.chairman.id,
+                    "member_name": self.chairman.name,
+                    "model_id": self.chairman.model_id,
+                    "persona": self.chairman.persona.name,
+                    "response": content,
+                }
+
+            _refresh_stage_context()
 
         return {
             "stage1": stage1_results,

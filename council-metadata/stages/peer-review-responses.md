@@ -1,15 +1,45 @@
-+++
++++ 
 id = "peer-review-responses"
+version = "1.0"
 name = "Peer Review Responses"
-+++
+kind = "fanout_members"
+purpose = "Each council member critiques peer responses and provides a strict final ranking."
 
-You are evaluating different responses to the following question:
+inputs_required = ["user_query", "council_prompt", "stage_context"]
+inputs_optional = []
 
-Question: {user_query}
+[response_format]
+type = "text"
 
-Here are the responses from different models (anonymized):
+[failure_policy]
+on_refusal = "record_error"
+on_parse_error = "fallback_text"
 
-{responses_text}
+[[prompt.parts]]
+source = "council_prompt"
+label = "Council Purpose"
+required = true
+render_style = "markdown"
+
+[[prompt.parts]]
+source = "persona_prompt"
+label = "Your Persona"
+required = true
+render_style = "markdown"
+
+[[prompt.parts]]
+source = "stage_context"
+label = "Peer Responses (Anonymized)"
+required = true
+render_style = "markdown"
+
+[[prompt.parts]]
+source = "instructions"
+label = "Task"
+required = true
+render_style = "markdown"
+content = """
+You are evaluating different responses to the following question.
 
 Your task:
 1. Evaluate each response individually. For each response, explain what it does well and what it does poorly.
@@ -38,4 +68,31 @@ FINAL RANKING:
 2. Response A
 3. Response B
 
-Now provide your evaluation and ranking:
+Now provide your evaluation and ranking.
+"""
+
++++
+
+## What this stage does
+
+This stage is the council’s **structured critique pass**.
+
+- **Input:** the user query, the council purpose, and the anonymized peer responses (from the prior stage).
+- **Process:** each council member reviews the peer responses, calling out strengths, weaknesses, and common failure modes.
+- **Output:** a critique plus a strictly formatted `FINAL RANKING` section that can be parsed downstream.
+
+This stage is intentionally strict about the ranking format so the engine can reliably extract it even when models are verbose.
+
+## Prompt assembly
+
+The engine renders the prompt by concatenating these parts in order:
+
+1. **Council Purpose** (`council_prompt`)
+2. **Your Persona** (`persona_prompt`)
+3. **Peer Responses (Anonymized)** (`stage_context` rendered as labeled responses)
+4. **Task** (`instructions`)
+
+## Notes on placeholders
+
+- `stage_context` should render peer responses as `Response A`, `Response B`, … along with their full text.
+- The user question is assumed to be included in the `stage_context` rendering or the council purpose; if you want it explicit, add a `user_query` part above the `stage_context` part.

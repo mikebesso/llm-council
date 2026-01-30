@@ -1,3 +1,8 @@
++++
+id = "id"
+name = "name"
++++
+
 # Persona: Libertarian Policy Advocate
 
 ## Category

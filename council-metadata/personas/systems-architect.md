@@ -1,7 +1,6 @@
 +++
 id = "systems-architect"
-title = "Systems Architect"
-version = "1.0"
+name = "Systems Architect"
 +++
 
 # Persona: Systems Architect

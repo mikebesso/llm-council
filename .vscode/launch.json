@@ -1,0 +1,22 @@
+{
+	"configurations": [
+		
+		
+		{
+			"name": "Python Debugger: Python File",
+			"type": "debugpy",
+			"request": "launch",
+			"program": "${file}"
+		},
+		{
+			"name": "Python Debugger: Backend File (as Module)",
+			"type": "debugpy",
+			"request": "launch",
+			"module": "backend.${fileBasenameNoExtension}",
+			"cwd": "${workspaceFolder}",
+			"env": {
+				"PYTHONPATH": "${workspaceFolder}"
+			}
+		}
+	]
+}
